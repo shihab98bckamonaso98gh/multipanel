@@ -52,11 +52,6 @@ CHECK_INTERVAL = 5
 INTERNAL_RETRIES = 3
 RETRY_BACKOFF = 15
 
-# Railway webhook settings
-WEBHOOK_URL = os.getenv("BOT_WEBHOOK_URL")
-WEBHOOK_SECRET = os.getenv("BOT_WEBHOOK_SECRET", os.urandom(16).hex())
-PORT = int(os.getenv("PORT", "8443"))
-
 # JSON data files
 MAIN_BUTTONS_FILE = "main_buttons.json"
 SUB_BUTTONS_FILE = "sub_buttons.json"
@@ -1356,6 +1351,7 @@ def main():
             ],
             UPLOAD_FILE: [
                 MessageHandler(filters.Document.ALL, upload_file_receive),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: upload_file_receive(u, c))  # fallback for non-file
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -1364,23 +1360,11 @@ def main():
 
     # Background monitoring
     async def post_init(app: Application):
-        # Set webhook on startup
-        if WEBHOOK_URL:
-            await app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook", secret_token=WEBHOOK_SECRET)
-            logger.info(f"Webhook set to {WEBHOOK_URL}/webhook")
         app.create_task(monitoring_loop(app))
-
     application.post_init = post_init
 
-    # Start the webhook server
-    logger.info("Starting webhook server...")
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path="webhook",
-        secret_token=WEBHOOK_SECRET,
-        webhook_url=f"{WEBHOOK_URL}/webhook" if WEBHOOK_URL else None,
-    )
+    logger.info("Bot started. Polling...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
