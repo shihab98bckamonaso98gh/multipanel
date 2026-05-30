@@ -7,6 +7,7 @@ import re
 import sqlite3
 import string
 import time
+import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Set
 
@@ -32,14 +33,17 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from telegram.warnings import PTBUserWarning
+
+warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 load_dotenv()
 
 # ---------- Configuration ----------
 TOKEN = os.getenv("BOT_TOKEN")
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID"))
-BOT_USERNAME = os.getenv("BOT_USERNAME")
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 USERNAME = "thanhxuan"
 PASSWORD = "thanhxuan"
 BASE_URL = "http://54.38.92.155/ints"
@@ -52,27 +56,26 @@ CHECK_INTERVAL = 5
 INTERNAL_RETRIES = 3
 RETRY_BACKOFF = 15
 
-# Railway webhook settings
-WEBHOOK_URL = os.getenv("BOT_WEBHOOK_URL")
+WEBHOOK_URL = os.getenv("BOT_WEBHOOK_URL", "")
 WEBHOOK_SECRET = os.getenv("BOT_WEBHOOK_SECRET", os.urandom(16).hex())
-PORT = int(os.getenv("PORT", "8443"))
+PORT = int(os.getenv("PORT", "8080"))
 
-# JSON data files
 MAIN_BUTTONS_FILE = "main_buttons.json"
 SUB_BUTTONS_FILE = "sub_buttons.json"
 POOLS_FILE = "pools.json"
 ASSIGNED_FILE = "assigned.json"
 USERS_FILE = "users.json"
-
-# SQLite database for wallet/withdraw and bans
 DB_FILE = "wallet.db"
 # ------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger("sms_otp_bot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 session = requests.Session()
 session.headers.update({
@@ -139,8 +142,16 @@ def save_users(users: Set[int]):
     save_json(USERS_FILE, list(users))
 
 # ---------- SQLite helpers ----------
+# Use a lock to prevent concurrent sqlite writes from asyncio threads
+_db_lock = asyncio.Lock() if False else None  # initialized in main
+
+def get_conn():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
@@ -175,81 +186,88 @@ def init_db():
 init_db()
 
 def is_banned(user_id):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     row = conn.execute("SELECT until FROM banned_users WHERE user_id=?", (user_id,)).fetchone()
     conn.close()
     return bool(row and row[0] > time.time())
 
 def ban_user(user_id, minutes=5):
     until = time.time() + minutes * 60
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     conn.execute("INSERT OR REPLACE INTO banned_users (user_id, until) VALUES (?, ?)", (user_id, until))
     conn.commit()
     conn.close()
 
 def ensure_user_exists(user_id):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     conn.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
     conn.commit()
     conn.close()
 
 def get_user_balance(user_id):
     ensure_user_exists(user_id)
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     row = conn.execute("SELECT balance_bdt FROM users WHERE user_id=?", (user_id,)).fetchone()
     conn.close()
     return row[0] if row else 0.0
 
 def credit_user(user_id, amount_bdt):
     ensure_user_exists(user_id)
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     conn.execute("UPDATE users SET balance_bdt = balance_bdt + ? WHERE user_id=?", (amount_bdt, user_id))
     conn.commit()
     conn.close()
 
 def deduct_user(user_id, amount_bdt):
     ensure_user_exists(user_id)
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     conn.execute("UPDATE users SET balance_bdt = balance_bdt - ? WHERE user_id=?", (amount_bdt, user_id))
     conn.commit()
     conn.close()
 
 def get_user_wallet(user_id):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     row = conn.execute("SELECT bkash, rocket, binance FROM users WHERE user_id=?", (user_id,)).fetchone()
     conn.close()
     return {'bkash': row[0], 'rocket': row[1], 'binance': row[2]} if row else {'bkash': None, 'rocket': None, 'binance': None}
 
 def set_wallet_detail(user_id, field, value):
     ensure_user_exists(user_id)
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     conn.execute(f"UPDATE users SET {field}=? WHERE user_id=?", (value, user_id))
     conn.commit()
     conn.close()
 
 def create_withdrawal(user_id, amount_bdt, method, wallet_detail):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    conn = sqlite3.connect(DB_FILE)
-    balance = conn.execute("SELECT balance_bdt FROM users WHERE user_id=?", (user_id,)).fetchone()[0]
-    if balance < amount_bdt:
+    conn = get_conn()
+    row = conn.execute("SELECT balance_bdt FROM users WHERE user_id=?", (user_id,)).fetchone()
+    if not row or row[0] < amount_bdt:
         conn.close()
         return False, "Insufficient balance."
     conn.execute("UPDATE users SET balance_bdt = balance_bdt - ? WHERE user_id=?", (amount_bdt, user_id))
-    conn.execute("INSERT INTO withdraw_requests (user_id, amount_bdt, method, wallet_detail, status, request_time) VALUES (?,?,?,?,'pending',?)",
-                 (user_id, amount_bdt, method, wallet_detail, now))
+    conn.execute(
+        "INSERT INTO withdraw_requests (user_id, amount_bdt, method, wallet_detail, status, request_time) VALUES (?,?,?,?,'pending',?)",
+        (user_id, amount_bdt, method, wallet_detail, now)
+    )
     conn.commit()
     conn.close()
     return True, None
 
 def get_pending_requests():
-    conn = sqlite3.connect(DB_FILE)
-    rows = conn.execute("SELECT id, user_id, amount_bdt, method, wallet_detail, request_time FROM withdraw_requests WHERE status='pending' ORDER BY request_time").fetchall()
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, user_id, amount_bdt, method, wallet_detail, request_time FROM withdraw_requests WHERE status='pending' ORDER BY request_time"
+    ).fetchall()
     conn.close()
     return [{'id': r[0], 'user_id': r[1], 'amount_bdt': r[2], 'method': r[3], 'wallet_detail': r[4], 'time': r[5]} for r in rows]
 
 def complete_withdrawal(request_id, admin_id):
-    conn = sqlite3.connect(DB_FILE)
-    row = conn.execute("SELECT id, user_id, amount_bdt, method, wallet_detail FROM withdraw_requests WHERE id=? AND status='pending'", (request_id,)).fetchone()
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT id, user_id, amount_bdt, method, wallet_detail FROM withdraw_requests WHERE id=? AND status='pending'",
+        (request_id,)
+    ).fetchone()
     if not row:
         conn.close()
         return None
@@ -281,22 +299,31 @@ def complete_withdrawal(request_id, admin_id):
     return user_id, msg
 
 def get_withdrawal_history(user_id=None):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     if user_id is None:
-        rows = conn.execute("SELECT id, user_id, amount_bdt, method, wallet_detail, request_time, completed_time FROM withdraw_requests WHERE status='completed' ORDER BY completed_time DESC LIMIT 200").fetchall()
+        # 7 columns: id, user_id, amount_bdt, method, wallet_detail, request_time, completed_time
+        rows = conn.execute(
+            "SELECT id, user_id, amount_bdt, method, wallet_detail, request_time, completed_time FROM withdraw_requests WHERE status='completed' ORDER BY completed_time DESC LIMIT 200"
+        ).fetchall()
+        conn.close()
+        return [{'id': r[0], 'user_id': r[1], 'amount_bdt': r[2], 'method': r[3], 'wallet': r[4], 'request_time': r[5], 'completed_time': r[6]} for r in rows]
     else:
-        rows = conn.execute("SELECT id, amount_bdt, method, wallet_detail, request_time, completed_time FROM withdraw_requests WHERE user_id=? AND status='completed' ORDER BY completed_time DESC", (user_id,)).fetchall()
-    conn.close()
-    return [{'id': r[0], 'user_id': r[1] if len(r)>6 else user_id, 'amount_bdt': r[2], 'method': r[3], 'wallet': r[4], 'request_time': r[5], 'completed_time': r[6]} for r in rows]
+        # 6 columns: id, amount_bdt, method, wallet_detail, request_time, completed_time
+        rows = conn.execute(
+            "SELECT id, amount_bdt, method, wallet_detail, request_time, completed_time FROM withdraw_requests WHERE user_id=? AND status='completed' ORDER BY completed_time DESC",
+            (user_id,)
+        ).fetchall()
+        conn.close()
+        return [{'id': r[0], 'user_id': user_id, 'amount_bdt': r[1], 'method': r[2], 'wallet': r[3], 'request_time': r[4], 'completed_time': r[5]} for r in rows]
 
 def get_setting(key, default=None):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     conn.close()
     return row[0] if row else default
 
 def set_setting(key, value):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
     conn.commit()
     conn.close()
@@ -318,20 +345,17 @@ def login() -> bool:
         logger.error("CAPTCHA question not found.")
         return False
     a, b = int(match.group(1)), int(match.group(2))
-    answer = a + b
-    logger.info(f"CAPTCHA: {a} + {b} = {answer}")
-    data = {"username": USERNAME, "password": PASSWORD, "capt": str(answer)}
+    data = {"username": USERNAME, "password": PASSWORD, "capt": str(a + b)}
     try:
         resp = session.post(SIGNIN_URL, data=data, allow_redirects=True, timeout=30)
     except Exception as e:
         logger.error(f"Login POST failed: {e}")
         return False
     if "Dashboard" in resp.text or "/agent/" in resp.url:
-        logger.info("Login successful.")
+        logger.info("✅ Login successful")
         return True
-    else:
-        logger.error("Login failed.")
-        return False
+    logger.error("Login failed")
+    return False
 
 def fetch_data_sync() -> list | None:
     today = datetime.now()
@@ -349,31 +373,26 @@ def fetch_data_sync() -> list | None:
         try:
             resp = session.get(DATA_URL, params=params, timeout=30)
         except Exception as e:
-            logger.warning(f"Data request attempt {attempt+1} failed: {e}")
+            if attempt == INTERNAL_RETRIES - 1:
+                logger.error(f"Data request failed after {INTERNAL_RETRIES} attempts: {e}")
             time.sleep(2)
             continue
         if "login" in resp.url.lower():
-            logger.warning("Session expired.")
+            logger.warning("Session expired")
             return None
         if resp.status_code != 200:
-            logger.warning(f"Status {resp.status_code}")
             time.sleep(2)
             continue
         try:
             json_data = resp.json()
         except Exception:
-            logger.error(f"JSON decode failed. First 300 chars: {resp.text[:300]}")
-            if "login" in resp.text.lower() and "password" in resp.text.lower():
-                logger.warning("Response is login page.")
-                return None
+            logger.warning("JSON decode failed")
             time.sleep(2)
             continue
         rows = json_data.get("aaData")
         if rows is None:
-            logger.info("No 'aaData' in response.")
             return []
         return rows
-    logger.error("Data fetch failed after all retries.")
     return None
 
 async def fetch_data_async() -> list | None:
@@ -428,6 +447,7 @@ async def send_otp_to_group(bot: Bot, row: list, otp: str):
     ])
     try:
         await bot.send_message(GROUP_CHAT_ID, text, reply_markup=keyboard)
+        logger.info(f"OTP {otp} forwarded to group")
     except Exception as e:
         logger.error(f"Failed to send to group: {e}")
 
@@ -446,6 +466,7 @@ async def send_otp_to_user(bot: Bot, user_id: int, row: list, otp: str, old_bala
     ])
     try:
         await bot.send_message(user_id, text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+        logger.info(f"OTP {otp} sent to user {user_id}")
     except Exception as e:
         logger.error(f"Failed to send to user {user_id}: {e}")
 
@@ -454,42 +475,45 @@ async def send_otp_to_user(bot: Bot, user_id: int, row: list, otp: str, old_bala
 # ----------------------------------------------------------------------
 async def monitoring_loop(application: Application):
     bot = application.bot
-    if not login():
-        logger.critical("Initial login failed.")
+    logged_in = await asyncio.to_thread(login)
+    if not logged_in:
+        logger.critical("Initial login failed")
         return
     seen_pairs = load_seen_pairs()
     rows = await fetch_data_async()
     if rows:
         for row in rows:
-            if len(row) < 9: continue
+            if len(row) < 9:
+                continue
             sms_text = str(row[5])
-            if "#" not in sms_text: continue
+            if "#" not in sms_text:
+                continue
             otp = extract_otp(sms_text)
-            if not otp: continue
+            if not otp:
+                continue
             number = str(row[2]).strip()
             pair = f"{number}|{otp}"
             if pair not in seen_pairs:
                 seen_pairs.add(pair)
                 save_seen_pair(number, otp)
-        logger.info(f"Initialized with {len(seen_pairs)} seen pairs.")
+        logger.info(f"Monitoring started – {len(seen_pairs)} known OTPs")
     else:
-        logger.warning("Initial data fetch failed.")
+        logger.warning("Could not fetch initial data")
 
     consecutive_failures = 0
     while True:
         rows = await fetch_data_async()
         if rows is None:
-            logger.warning(f"Data fetch failed. Consecutive failures: {consecutive_failures+1}")
+            logger.warning(f"Data fetch failed ({consecutive_failures+1} consecutive)")
             if consecutive_failures == 0:
-                logger.info("Attempting re-login...")
-                if login():
+                relogged = await asyncio.to_thread(login)
+                if relogged:
                     consecutive_failures = 0
                 else:
                     consecutive_failures += 1
             else:
                 consecutive_failures += 1
             backoff = RETRY_BACKOFF * min(consecutive_failures, 3)
-            logger.info(f"Waiting {backoff}s before retry.")
             await asyncio.sleep(backoff)
             continue
         consecutive_failures = 0
@@ -497,11 +521,14 @@ async def monitoring_loop(application: Application):
         assigned = load_assigned()
         per_otp = float(get_setting("per_otp_bdt", "0.30"))
         for row in rows:
-            if len(row) < 9: continue
+            if len(row) < 9:
+                continue
             sms_text = str(row[5])
-            if "#" not in sms_text: continue
+            if "#" not in sms_text:
+                continue
             otp = extract_otp(sms_text)
-            if not otp: continue
+            if not otp:
+                continue
             number = str(row[2]).strip()
             pair = f"{number}|{otp}"
             if pair in seen_pairs:
@@ -521,7 +548,7 @@ async def monitoring_loop(application: Application):
         await asyncio.sleep(CHECK_INTERVAL)
 
 # ----------------------------------------------------------------------
-# Rate limiting for Get Number
+# Rate limiting
 # ----------------------------------------------------------------------
 def check_get_number_rate_limit(user_id):
     now = time.time()
@@ -530,6 +557,31 @@ def check_get_number_rate_limit(user_id):
         return False, 10 - int(now - last)
     last_get_number[user_id] = now
     return True, 0
+
+# ----------------------------------------------------------------------
+# Helper: reply safely in both message and callback contexts
+# ----------------------------------------------------------------------
+async def safe_reply(update: Update, text: str, **kwargs):
+    """Reply works whether called from a message handler or callback handler."""
+    if update.message:
+        return await update.message.reply_text(text, **kwargs)
+    elif update.callback_query:
+        return await update.callback_query.edit_message_text(text, **kwargs)
+
+# ----------------------------------------------------------------------
+# Keyboard helpers
+# ----------------------------------------------------------------------
+def admin_profile_kb():
+    return [
+        ["💰 Balance", "📋 Pending"],
+        ["✅ Approved", "✏️ Edit"],
+        ["📢 Broadcast", "Upload"],
+        ["Add/Remove Main Button", "Add/Remove Sub Button"],
+        ["⬅️ Back"]
+    ]
+
+def user_profile_kb():
+    return [["💰 Balance", "📋 Withdraw History"], ["⬅️ Back"]]
 
 # ----------------------------------------------------------------------
 # Telegram handlers
@@ -543,7 +595,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ["Get Number", "Fake Name"],
         ["Get 2FA", "👤 My Profile"]
     ]
-    await update.message.reply_text("Welcome! Choose an option:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    await update.message.reply_text(
+        "Welcome! Choose an option:",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    )
 
 # ── Get Number flow ──
 async def get_number_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -560,7 +615,7 @@ async def get_number_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    main_name = query.data.split(":",1)[1]
+    main_name = query.data.split(":", 1)[1]
     subs = load_sub_buttons().get(main_name, [])
     if not subs:
         await query.edit_message_text("No sub-categories available.")
@@ -573,10 +628,11 @@ async def assign_number_and_display(query_or_update, main_name, sub_name, user_i
     pools = load_pools()
     numbers = pools.get(pool_key, [])
     if not numbers:
+        msg = "No numbers available in this category."
         if hasattr(query_or_update, 'edit_message_text'):
-            await query_or_update.edit_message_text("No numbers available in this category.")
+            await query_or_update.edit_message_text(msg)
         else:
-            await query_or_update.message.reply_text("No numbers available in this category.")
+            await query_or_update.message.reply_text(msg)
         return
     assigned_number = numbers.pop(0)
     pools[pool_key] = numbers
@@ -608,7 +664,7 @@ async def get_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed:
         await query.edit_message_text(f"⏳ Please wait {wait} seconds before requesting another number.")
         return
-    _, main_name, sub_name = query.data.split(":",2)
+    _, main_name, sub_name = query.data.split(":", 2)
     await assign_number_and_display(query, main_name, sub_name, user_id, context)
 
 async def change_number_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -622,10 +678,10 @@ async def change_number_callback(update: Update, context: ContextTypes.DEFAULT_T
     if not allowed:
         await query.edit_message_text(f"⏳ Wait {wait}s.")
         return
-    _, main_name, sub_name = query.data.split(":",2)
+    _, main_name, sub_name = query.data.split(":", 2)
     await assign_number_and_display(query, main_name, sub_name, user_id, context)
 
-# ── Fake Name flow (ConversationHandler only) ──
+# ── Fake Name flow ──
 FAKE_GENDER = 1
 
 async def fake_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -651,14 +707,12 @@ async def fake_gender_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
         first = fake.first_name_female()
         last = fake.last_name()
     full_name = f"{first} {last}"
-    username = f"{first.lower()}{last.lower()}{random.randint(10,99)}"
-
+    username = f"{first.lower()}{last.lower()}{random.randint(10, 99)}"
     chars = string.ascii_letters + string.digits + "!@#$%^&*()_+-="
-    random_part = ''.join(random.choices(chars, k=random.randint(8,10)))
+    random_part = ''.join(random.choices(chars, k=random.randint(8, 10)))
     tz = timezone(timedelta(hours=6))
     day = datetime.now(tz).day
     password = f"{random_part}{day}"
-
     text = (
         f"{'👨' if gender=='male' else '👩'} <b>Generated Identity:</b>\n\n"
         f"<b>Name:</b> {full_name}\n"
@@ -674,16 +728,15 @@ async def fake_gender_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
     return FAKE_GENDER
 
-# ── Get 2FA flow (ConversationHandler only) ──
-GET2FA_SECRET = 1
+# ── Get 2FA flow ──
+GET2FA_SECRET = 10
 
 async def get2fa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_banned(update.effective_user.id):
         await update.message.reply_text("🚫 Banned.")
         return ConversationHandler.END
     await update.message.reply_text(
-        "📲 <b>Paste your 2FA Secret Key</b>\n\n"
-        "<i>Example: JBSWY3DPEHPK3PXP</i>",
+        "📲 <b>Paste your 2FA Secret Key</b>\n\n<i>Example: JBSWY3DPEHPK3PXP</i>",
         parse_mode=ParseMode.HTML
     )
     return GET2FA_SECRET
@@ -693,8 +746,7 @@ async def get2fa_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     secret_clean = re.sub(r'\s+', '', secret_raw).upper()
     if not re.fullmatch(r'[A-Z2-7]+', secret_clean):
         await update.message.reply_text(
-            "❌ Invalid secret key. Only characters A-Z and 2-7 are allowed after removing spaces.\n"
-            "Please try again or /cancel."
+            "❌ Invalid secret key. Only A-Z and 2-7 are allowed.\nTry again or /cancel."
         )
         return GET2FA_SECRET
     try:
@@ -712,7 +764,10 @@ async def get2fa_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ── Admin: Add/Remove Main Button ──
-ADD_MAIN, REMOVE_MAIN_SELECT = range(2)
+# State constants — use non-overlapping integers across all conversations
+ADD_MAIN_MENU = 20
+ADD_MAIN_RECEIVE = 21
+REMOVE_MAIN_SELECT = 22
 
 async def add_remove_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -720,21 +775,49 @@ async def add_remove_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     keyboard = [["Add Main Button", "Remove Main Button"], ["⬅️ Back"]]
     await update.message.reply_text("Choose action:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
-    return ADD_MAIN
+    return ADD_MAIN_MENU
 
-async def add_main_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text == "⬅️ Back":
-        return await back_to_profile(update, context)
-    await update.message.reply_text("Send the name of the new main button:", reply_markup=ReplyKeyboardMarkup([["⬅️ Back"]], resize_keyboard=True))
-    return ADD_MAIN
+async def add_remove_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Back":
+        await update.message.reply_text(
+            "👤 Profile Menu",
+            reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True)
+        )
+        return ConversationHandler.END
+    elif text == "Add Main Button":
+        await update.message.reply_text(
+            "Send the name of the new main button:",
+            reply_markup=ReplyKeyboardMarkup([["⬅️ Back"]], resize_keyboard=True)
+        )
+        return ADD_MAIN_RECEIVE
+    elif text == "Remove Main Button":
+        mains = load_main_buttons()
+        if not mains:
+            await update.message.reply_text(
+                "No main buttons to remove.",
+                reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True)
+            )
+            return ConversationHandler.END
+        keyboard = [[InlineKeyboardButton(m, callback_data=f"remove_main:{m}")] for m in mains]
+        await update.message.reply_text("Select main button to remove:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return REMOVE_MAIN_SELECT
+    return ADD_MAIN_MENU
 
 async def add_main_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "⬅️ Back":
-        return await back_to_profile(update, context)
+        await update.message.reply_text(
+            "👤 Profile Menu",
+            reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True)
+        )
+        return ConversationHandler.END
     name = update.message.text.strip()
     mains = load_main_buttons()
     if name in mains:
-        await update.message.reply_text("Already exists.", reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True))
+        await update.message.reply_text(
+            "Already exists.",
+            reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True)
+        )
     else:
         mains.append(name)
         save_main_buttons(mains)
@@ -742,28 +825,19 @@ async def add_main_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if name not in sub_buttons:
             sub_buttons[name] = []
             save_sub_buttons(sub_buttons)
-        await update.message.reply_text(f"Main button '{name}' added.", reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True))
+        await update.message.reply_text(
+            f"Main button '{name}' added.",
+            reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True)
+        )
     return ConversationHandler.END
-
-async def remove_main_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text == "⬅️ Back":
-        return await back_to_profile(update, context)
-    mains = load_main_buttons()
-    if not mains:
-        await update.message.reply_text("No main buttons to remove.", reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True))
-        return ConversationHandler.END
-    keyboard = [[InlineKeyboardButton(m, callback_data=f"remove_main:{m}")] for m in mains]
-    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="cancel")])
-    await update.message.reply_text("Select main button to remove:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return REMOVE_MAIN_SELECT
 
 async def remove_main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "cancel":
         await query.edit_message_text("Cancelled.")
-        return await back_to_profile(update, context)
-    main_name = query.data.split(":",1)[1]
+        return ConversationHandler.END
+    main_name = query.data.split(":", 1)[1]
     mains = load_main_buttons()
     if main_name in mains:
         mains.remove(main_name)
@@ -782,7 +856,11 @@ async def remove_main_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 # ── Admin: Add/Remove Sub Button ──
-ADD_SUB_MAIN_SELECT, ADD_SUB_NAME, REMOVE_SUB_MAIN_SELECT, REMOVE_SUB_SELECT = range(4)
+ADD_SUB_MENU = 30
+ADD_SUB_MAIN_SELECT = 31
+ADD_SUB_NAME_RECEIVE = 32
+REMOVE_SUB_MAIN_SELECT = 33
+REMOVE_SUB_SELECT = 34
 
 async def add_remove_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -790,34 +868,52 @@ async def add_remove_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     keyboard = [["Add Sub Button", "Remove Sub Button"], ["⬅️ Back"]]
     await update.message.reply_text("Choose action:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
-    return ADD_SUB_MAIN_SELECT
+    return ADD_SUB_MENU
 
-async def add_sub_main_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text == "⬅️ Back":
-        return await back_to_profile(update, context)
-    mains = load_main_buttons()
-    if not mains:
-        await update.message.reply_text("No main buttons.", reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True))
+async def add_remove_sub_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Back":
+        await update.message.reply_text(
+            "👤 Profile Menu",
+            reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True)
+        )
         return ConversationHandler.END
-    keyboard = [[InlineKeyboardButton(m, callback_data=f"add_sub_main:{m}")] for m in mains]
-    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="cancel")])
-    await update.message.reply_text("Select main button:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return ADD_SUB_NAME
+    elif text == "Add Sub Button":
+        mains = load_main_buttons()
+        if not mains:
+            await update.message.reply_text("No main buttons.", reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True))
+            return ConversationHandler.END
+        keyboard = [[InlineKeyboardButton(m, callback_data=f"add_sub_main:{m}")] for m in mains]
+        await update.message.reply_text("Select main button:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return ADD_SUB_MAIN_SELECT
+    elif text == "Remove Sub Button":
+        mains = load_main_buttons()
+        if not mains:
+            await update.message.reply_text("No main buttons.", reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True))
+            return ConversationHandler.END
+        keyboard = [[InlineKeyboardButton(m, callback_data=f"remove_sub_main:{m}")] for m in mains]
+        await update.message.reply_text("Select main button:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return REMOVE_SUB_MAIN_SELECT
+    return ADD_SUB_MENU
 
 async def add_sub_main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "cancel":
         await query.edit_message_text("Cancelled.")
-        return await back_to_profile(update, context)
-    context.user_data["add_sub_main"] = query.data.split(":",1)[1]
+        return ConversationHandler.END
+    context.user_data["add_sub_main"] = query.data.split(":", 1)[1]
     await query.edit_message_text("Send the name of the new sub button:")
-    return ADD_SUB_NAME
+    return ADD_SUB_NAME_RECEIVE
 
 async def add_sub_name_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "⬅️ Back":
-        return await back_to_profile(update, context)
-    main_name = context.user_data["add_sub_main"]
+        await update.message.reply_text(
+            "👤 Profile Menu",
+            reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True)
+        )
+        return ConversationHandler.END
+    main_name = context.user_data.get("add_sub_main", "")
     sub_name = update.message.text.strip()
     sub_buttons = load_sub_buttons()
     if main_name not in sub_buttons:
@@ -827,28 +923,19 @@ async def add_sub_name_receive(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         sub_buttons[main_name].append(sub_name)
         save_sub_buttons(sub_buttons)
-        await update.message.reply_text(f"Sub button '{sub_name}' added under '{main_name}'.", reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True))
+        await update.message.reply_text(
+            f"Sub button '{sub_name}' added under '{main_name}'.",
+            reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True)
+        )
     return ConversationHandler.END
-
-async def remove_sub_main_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text == "⬅️ Back":
-        return await back_to_profile(update, context)
-    mains = load_main_buttons()
-    if not mains:
-        await update.message.reply_text("No main buttons.", reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True))
-        return ConversationHandler.END
-    keyboard = [[InlineKeyboardButton(m, callback_data=f"remove_sub_main:{m}")] for m in mains]
-    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="cancel")])
-    await update.message.reply_text("Select main button:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return REMOVE_SUB_SELECT
 
 async def remove_sub_main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "cancel":
         await query.edit_message_text("Cancelled.")
-        return await back_to_profile(update, context)
-    main_name = query.data.split(":",1)[1]
+        return ConversationHandler.END
+    main_name = query.data.split(":", 1)[1]
     subs = load_sub_buttons().get(main_name, [])
     if not subs:
         await query.edit_message_text(f"No sub buttons under '{main_name}'.")
@@ -864,8 +951,8 @@ async def remove_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     if query.data == "cancel":
         await query.edit_message_text("Cancelled.")
-        return await back_to_profile(update, context)
-    _, main_name, sub_name = query.data.split(":",2)
+        return ConversationHandler.END
+    _, main_name, sub_name = query.data.split(":", 2)
     sub_buttons = load_sub_buttons()
     if main_name in sub_buttons and sub_name in sub_buttons[main_name]:
         sub_buttons[main_name].remove(sub_name)
@@ -879,8 +966,10 @@ async def remove_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("Not found.")
     return ConversationHandler.END
 
-# ── Admin: Upload numbers (now replaces old pool) ──
-UPLOAD_MAIN_SELECT, UPLOAD_SUB_SELECT, UPLOAD_FILE = range(100, 103)
+# ── Admin: Upload numbers ──
+UPLOAD_MAIN_SELECT = 40
+UPLOAD_SUB_SELECT = 41
+UPLOAD_FILE = 42
 
 async def upload_from_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -900,8 +989,8 @@ async def upload_main_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     if query.data == "cancel_upload":
         await query.edit_message_text("Cancelled.")
-        return await back_to_profile(update, context)
-    main_name = query.data.split(":",1)[1]
+        return ConversationHandler.END
+    main_name = query.data.split(":", 1)[1]
     context.user_data["upload_main"] = main_name
     subs = load_sub_buttons().get(main_name, [])
     if not subs:
@@ -917,8 +1006,8 @@ async def upload_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     if query.data == "cancel_upload":
         await query.edit_message_text("Cancelled.")
-        return await back_to_profile(update, context)
-    _, main_name, sub_name = query.data.split(":",2)
+        return ConversationHandler.END
+    _, main_name, sub_name = query.data.split(":", 2)
     context.user_data["upload_main"] = main_name
     context.user_data["upload_sub"] = sub_name
     await query.edit_message_text(f"Send a .txt file with numbers (one per line) for {main_name} / {sub_name}.")
@@ -939,35 +1028,43 @@ async def upload_file_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
     sub_name = context.user_data["upload_sub"]
     pool_key = f"{main_name}_{sub_name}"
     pools = load_pools()
-    # Replace the entire pool instead of extending
     pools[pool_key] = numbers
     save_pools(pools)
-
     try:
-        await update.message.bot.send_message(GROUP_CHAT_ID, f"{main_name}র {sub_name} নাম্বার যুক্ত করা হয়েছে।")
+        await update.message.bot.send_message(GROUP_CHAT_ID, f"{main_name}র {sub_name} নাম্বার যুক্ত করা হয়েছে।")
     except Exception as e:
-        logger.error(f"Broadcast upload notification failed: {e}")
-
-    await update.message.reply_text(f"Added {len(numbers)} numbers to {main_name} / {sub_name}.", reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True))
+        logger.error(f"Upload notification failed: {e}")
+    await update.message.reply_text(
+        f"Added {len(numbers)} numbers to {main_name} / {sub_name}.",
+        reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True)
+    )
     return ConversationHandler.END
 
 # ── Admin: Broadcast ──
-BROADCAST_RECEIVE, BROADCAST_CONFIRM = range(2)
+BROADCAST_RECEIVE = 50
+BROADCAST_CONFIRM = 51
 
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("Access denied.")
         return ConversationHandler.END
-    await update.message.reply_text("Send the content you want to broadcast (text, photo, video, file).", reply_markup=ReplyKeyboardMarkup([["⬅️ Back"]], resize_keyboard=True))
+    await update.message.reply_text(
+        "Send the content you want to broadcast (text, photo, video, file).",
+        reply_markup=ReplyKeyboardMarkup([["⬅️ Back"]], resize_keyboard=True)
+    )
     return BROADCAST_RECEIVE
 
 async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "⬅️ Back":
-        return await back_to_profile(update, context)
+        await update.message.reply_text(
+            "👤 Profile Menu",
+            reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True)
+        )
+        return ConversationHandler.END
     context.user_data["broadcast_msg"] = update.message
     keyboard = [
         [InlineKeyboardButton("Yes, send to all", callback_data="broadcast_confirm")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="broadcast_cancel")]
+        [InlineKeyboardButton("⬅️ Cancel", callback_data="broadcast_cancel")]
     ]
     await update.message.reply_text("Confirm broadcast?", reply_markup=InlineKeyboardMarkup(keyboard))
     return BROADCAST_CONFIRM
@@ -977,10 +1074,12 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if query.data == "broadcast_cancel":
         await query.edit_message_text("Cancelled.")
-        return await back_to_profile(update, context)
-
+        return ConversationHandler.END
     users = load_users()
-    msg = context.user_data["broadcast_msg"]
+    msg = context.user_data.get("broadcast_msg")
+    if not msg:
+        await query.edit_message_text("No message to broadcast.")
+        return ConversationHandler.END
     bot = context.bot
     success = 0
     for uid in users:
@@ -993,42 +1092,39 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(f"Broadcast finished. Sent to {success}/{len(users)} users.")
     return ConversationHandler.END
 
-# ── Helper: admin profile keyboard ──
-def admin_profile_kb():
-    return [
-        ["💰 Balance", "📋 Pending"],
-        ["✅ Approved", "✏️ Edit"],
-        ["📢 Broadcast", "Upload"],
-        ["Add/Remove Main Button", "Add/Remove Sub Button"],
-        ["⬅️ Back"]
-    ]
-
-async def back_to_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    await update.message.reply_text("👤 Profile Menu", reply_markup=ReplyKeyboardMarkup(admin_profile_kb() if is_admin(user_id) else [["💰 Balance", "📋 Withdraw History"], ["⬅️ Back"]], resize_keyboard=True))
+    kb = admin_profile_kb() if is_admin(user_id) else user_profile_kb()
+    await update.message.reply_text(
+        "Cancelled.",
+        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
+    )
     return ConversationHandler.END
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await back_to_profile(update, context)
-
 # ── Profile menu ──
-PROFILE_SELECT, SET_WALLET_METHOD, SET_WALLET_VALUE, WITHDRAW_METHOD, WITHDRAW_AMOUNT, EDIT_MENU, EDIT_PRICE, EDIT_RATE = range(8)
+PROFILE_SELECT = 60
+SET_WALLET_METHOD = 61
+SET_WALLET_VALUE = 62
+WITHDRAW_METHOD = 63
+WITHDRAW_AMOUNT = 64
+EDIT_MENU = 65
+EDIT_PRICE = 66
+EDIT_RATE = 67
 
 async def profile_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if is_admin(user_id):
-        await update.message.reply_text("👤 Profile Menu", reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True))
-    else:
-        kb = [["💰 Balance", "📋 Withdraw History"], ["⬅️ Back"]]
-        await update.message.reply_text("👤 Profile Menu", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    kb = admin_profile_kb() if is_admin(user_id) else user_profile_kb()
+    await update.message.reply_text("👤 Profile Menu", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
     return PROFILE_SELECT
 
 async def profile_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
+
     if text == "⬅️ Back":
         await start(update, context)
         return ConversationHandler.END
+
     elif text == "💰 Balance":
         balance = get_user_balance(user_id)
         wallet = get_user_wallet(user_id)
@@ -1047,8 +1143,9 @@ async def profile_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("Set Wallet", callback_data="profile_set_wallet"),
              InlineKeyboardButton("Withdraw", callback_data="profile_withdraw")]
         ])
-        await update.message.reply_text(msg, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+        await update.message.reply_text(msg, reply_markup=keyboard)
         return PROFILE_SELECT
+
     elif text == "📋 Pending" and is_admin(user_id):
         pending = get_pending_requests()
         if not pending:
@@ -1057,36 +1154,79 @@ async def profile_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines = []
             kb_buttons = []
             for p in pending:
-                lines.append(f"🔹 ID: {p['id']} | User: {p['user_id']}\n   💵 {p['amount_bdt']} BDT via {p['method']} ({p['wallet_detail']})\n   🕒 {p['time']}")
+                lines.append(
+                    f"🔹 ID: {p['id']} | User: {p['user_id']}\n"
+                    f"   💵 {p['amount_bdt']} BDT via {p['method']} ({p['wallet_detail']})\n"
+                    f"   🕒 {p['time']}"
+                )
                 kb_buttons.append([InlineKeyboardButton(f"✅ Complete #{p['id']}", callback_data=f"admin_complete_{p['id']}")])
-            await update.message.reply_text("📋 <b>Pending Withdrawals:</b>\n\n" + "\n\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb_buttons))
+            await update.message.reply_text(
+                "📋 <b>Pending Withdrawals:</b>\n\n" + "\n\n".join(lines),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(kb_buttons)
+            )
         return PROFILE_SELECT
+
     elif text == "✅ Approved" and is_admin(user_id):
         history = get_withdrawal_history(user_id=None)
         if not history:
             await update.message.reply_text("No approved withdrawals yet.")
         else:
-            lines = [f"🔹 ID: {h['id']} | User: {h['user_id']}\n   💵 {h['amount_bdt']} BDT via {h['method']} ({h['wallet']})\n   📅 {h['completed_time']}" for h in history]
-            await update.message.reply_text("✅ <b>Approved Withdrawals:</b>\n\n" + "\n\n".join(lines), parse_mode=ParseMode.HTML)
+            lines = [
+                f"🔹 ID: {h['id']} | User: {h['user_id']}\n"
+                f"   💵 {h['amount_bdt']} BDT via {h['method']} ({h['wallet']})\n"
+                f"   📅 {h['completed_time']}"
+                for h in history
+            ]
+            await update.message.reply_text(
+                "✅ <b>Approved Withdrawals:</b>\n\n" + "\n\n".join(lines),
+                parse_mode=ParseMode.HTML
+            )
         return PROFILE_SELECT
+
     elif text == "📋 Withdraw History" and not is_admin(user_id):
         history = get_withdrawal_history(user_id=user_id)
         if not history:
             await update.message.reply_text("No completed withdrawals yet.")
         else:
-            lines = [f"🔹 ID: {h['id']}\n   💵 {h['amount_bdt']} BDT via {h['method']} ({h['wallet']})\n   📅 {h['completed_time']}" for h in history]
-            await update.message.reply_text("📋 <b>Your Withdraw History:</b>\n\n" + "\n\n".join(lines), parse_mode=ParseMode.HTML)
+            lines = [
+                f"🔹 ID: {h['id']}\n"
+                f"   💵 {h['amount_bdt']} BDT via {h['method']} ({h['wallet']})\n"
+                f"   📅 {h['completed_time']}"
+                for h in history
+            ]
+            await update.message.reply_text(
+                "📋 <b>Your Withdraw History:</b>\n\n" + "\n\n".join(lines),
+                parse_mode=ParseMode.HTML
+            )
         return PROFILE_SELECT
+
     elif text == "✏️ Edit" and is_admin(user_id):
         kb = [["Withdraw price", "Rate"], ["⬅️ Back"]]
         await update.message.reply_text("Edit Menu", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
         return EDIT_MENU
-    elif text == "Upload" and is_admin(user_id):
-        return await upload_from_profile(update, context)
-    else:
-        return PROFILE_SELECT
 
-# ── Set Wallet flow ──
+    elif text == "Upload" and is_admin(user_id):
+        # Inline upload flow — transition into upload states
+        mains = load_main_buttons()
+        if not mains:
+            await update.message.reply_text("No main buttons.", reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True))
+            return PROFILE_SELECT
+        keyboard = [[InlineKeyboardButton(m, callback_data=f"upload_main:{m}")] for m in mains]
+        keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="cancel_upload")])
+        await update.message.reply_text("Select main button:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return UPLOAD_MAIN_SELECT
+
+    elif text == "📢 Broadcast" and is_admin(user_id):
+        await update.message.reply_text(
+            "Send the content you want to broadcast (text, photo, video, file).",
+            reply_markup=ReplyKeyboardMarkup([["⬅️ Back"]], resize_keyboard=True)
+        )
+        return BROADCAST_RECEIVE
+
+    return PROFILE_SELECT
+
+# ── Set Wallet flow (inside profile_conv via callbacks) ──
 async def profile_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1121,15 +1261,25 @@ async def wallet_method_select(update: Update, context: ContextTypes.DEFAULT_TYP
 async def wallet_value_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     value = update.message.text.strip()
-    method = context.user_data["wallet_method"]
+    method = context.user_data.get("wallet_method", "")
     if method in ("bkash", "rocket") and not re.fullmatch(r"\d{7,15}", value):
-        await update.message.reply_text("Invalid phone number. Must be 7-15 digits. Try again or /cancel.", reply_markup=ReplyKeyboardMarkup([["⬅️ Back"]], resize_keyboard=True))
+        await update.message.reply_text(
+            "Invalid phone number. Must be 7-15 digits. Try again or /cancel.",
+            reply_markup=ReplyKeyboardMarkup([["⬅️ Back"]], resize_keyboard=True)
+        )
         return SET_WALLET_VALUE
     elif method == "binance" and not re.fullmatch(r"\d{6,}", value):
-        await update.message.reply_text("Invalid Binance UID. Must be numeric. Try again or /cancel.", reply_markup=ReplyKeyboardMarkup([["⬅️ Back"]], resize_keyboard=True))
+        await update.message.reply_text(
+            "Invalid Binance UID. Must be numeric. Try again or /cancel.",
+            reply_markup=ReplyKeyboardMarkup([["⬅️ Back"]], resize_keyboard=True)
+        )
         return SET_WALLET_VALUE
     set_wallet_detail(user_id, method, value)
-    await update.message.reply_text(f"{method.capitalize()} wallet set to: {value}", reply_markup=ReplyKeyboardMarkup(admin_profile_kb() if is_admin(user_id) else [["💰 Balance", "📋 Withdraw History"], ["⬅️ Back"]], resize_keyboard=True))
+    kb = admin_profile_kb() if is_admin(user_id) else user_profile_kb()
+    await update.message.reply_text(
+        f"{method.capitalize()} wallet set to: {value}",
+        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
+    )
     return ConversationHandler.END
 
 async def withdraw_method_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1138,10 +1288,7 @@ async def withdraw_method_select(update: Update, context: ContextTypes.DEFAULT_T
     method = query.data.replace("withdraw_method_", "")
     context.user_data["withdraw_method"] = method
     wallet = get_user_wallet(query.from_user.id)
-    if method in ("bkash", "rocket", "binance"):
-        detail = wallet.get(method)
-    else:
-        detail = wallet.get("bkash")
+    detail = wallet.get(method) if method in ("bkash", "rocket", "binance") else wallet.get("bkash")
     if not detail:
         await query.edit_message_text(f"Your {method} wallet is not set. Use 'Set Wallet' first.")
         return ConversationHandler.END
@@ -1164,38 +1311,64 @@ async def withdraw_amount_received(update: Update, context: ContextTypes.DEFAULT
     try:
         amount = float(text)
     except ValueError:
-        await update.message.reply_text("Invalid number. Try again or /cancel.", reply_markup=ReplyKeyboardMarkup([["⬅️ Back"]], resize_keyboard=True))
+        await update.message.reply_text(
+            "Invalid number. Try again or /cancel.",
+            reply_markup=ReplyKeyboardMarkup([["⬅️ Back"]], resize_keyboard=True)
+        )
         return WITHDRAW_AMOUNT
     min_bdt = float(get_setting("min_withdrawal_bdt", "20.0"))
     if amount < min_bdt:
-        await update.message.reply_text(f"Minimum withdrawal is {min_bdt} BDT.", reply_markup=ReplyKeyboardMarkup([["⬅️ Back"]], resize_keyboard=True))
+        await update.message.reply_text(
+            f"Minimum withdrawal is {min_bdt} BDT.",
+            reply_markup=ReplyKeyboardMarkup([["⬅️ Back"]], resize_keyboard=True)
+        )
         return WITHDRAW_AMOUNT
-    success, err = create_withdrawal(user_id, amount, context.user_data["withdraw_method"], context.user_data["withdraw_wallet_detail"])
+    success, err = create_withdrawal(
+        user_id, amount,
+        context.user_data["withdraw_method"],
+        context.user_data["withdraw_wallet_detail"]
+    )
+    kb = admin_profile_kb() if is_admin(user_id) else user_profile_kb()
     if success:
-        await update.message.reply_text("✅ Withdrawal request submitted. Processing...", reply_markup=ReplyKeyboardMarkup(admin_profile_kb() if is_admin(user_id) else [["💰 Balance", "📋 Withdraw History"], ["⬅️ Back"]], resize_keyboard=True))
+        await update.message.reply_text(
+            "✅ Withdrawal request submitted. Processing...",
+            reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
+        )
     else:
-        await update.message.reply_text(f"❌ {err}", reply_markup=ReplyKeyboardMarkup(admin_profile_kb() if is_admin(user_id) else [["💰 Balance", "📋 Withdraw History"], ["⬅️ Back"]], resize_keyboard=True))
+        await update.message.reply_text(
+            f"❌ {err}",
+            reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
+        )
     return ConversationHandler.END
 
 async def edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if text == "Withdraw price":
         cur_min = get_setting("min_withdrawal_bdt", "20.0")
-        await update.message.reply_text(f"Current minimum withdrawal: {cur_min} BDT\nEnter new minimum amount in BDT:", reply_markup=ReplyKeyboardMarkup([["⬅️ Back"]], resize_keyboard=True))
+        await update.message.reply_text(
+            f"Current minimum withdrawal: {cur_min} BDT\nEnter new minimum amount in BDT:",
+            reply_markup=ReplyKeyboardMarkup([["⬅️ Back"]], resize_keyboard=True)
+        )
         return EDIT_PRICE
     elif text == "Rate":
         cur_rate = get_setting("per_otp_bdt", "0.30")
-        await update.message.reply_text(f"Current OTP earning rate: {cur_rate} BDT per OTP\nEnter new rate in BDT:", reply_markup=ReplyKeyboardMarkup([["⬅️ Back"]], resize_keyboard=True))
+        await update.message.reply_text(
+            f"Current OTP earning rate: {cur_rate} BDT per OTP\nEnter new rate in BDT:",
+            reply_markup=ReplyKeyboardMarkup([["⬅️ Back"]], resize_keyboard=True)
+        )
         return EDIT_RATE
     elif text == "⬅️ Back":
-        return await profile_start(update, context)
-    else:
-        return EDIT_MENU
+        kb = admin_profile_kb()
+        await update.message.reply_text("👤 Profile Menu", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+        return PROFILE_SELECT
+    return EDIT_MENU
 
 async def edit_price_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if text == "⬅️ Back":
-        return await profile_start(update, context)
+        kb = [["Withdraw price", "Rate"], ["⬅️ Back"]]
+        await update.message.reply_text("Edit Menu", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+        return EDIT_MENU
     try:
         new_min = float(text)
         if new_min <= 0:
@@ -1204,13 +1377,18 @@ async def edit_price_received(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Invalid amount. Positive number only.")
         return EDIT_PRICE
     set_setting("min_withdrawal_bdt", new_min)
-    await update.message.reply_text(f"Minimum withdrawal updated to {new_min} BDT.", reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True))
+    await update.message.reply_text(
+        f"Minimum withdrawal updated to {new_min} BDT.",
+        reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True)
+    )
     return ConversationHandler.END
 
 async def edit_rate_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if text == "⬅️ Back":
-        return await profile_start(update, context)
+        kb = [["Withdraw price", "Rate"], ["⬅️ Back"]]
+        await update.message.reply_text("Edit Menu", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+        return EDIT_MENU
     try:
         new_rate = float(text)
         if new_rate <= 0:
@@ -1219,7 +1397,10 @@ async def edit_rate_received(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Invalid rate. Positive number only.")
         return EDIT_RATE
     set_setting("per_otp_bdt", new_rate)
-    await update.message.reply_text(f"OTP earning rate updated to {new_rate} BDT.", reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True))
+    await update.message.reply_text(
+        f"OTP earning rate updated to {new_rate} BDT.",
+        reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True)
+    )
     return ConversationHandler.END
 
 async def admin_complete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1235,7 +1416,6 @@ async def admin_complete_callback(update: Update, context: ContextTypes.DEFAULT_
     user_id, msg = result
     await context.bot.send_message(user_id, msg, parse_mode=ParseMode.HTML)
     await query.edit_message_text(f"✅ Withdrawal #{req_id} approved and user notified.")
-    return
 
 # ----------------------------------------------------------------------
 # Build the Application
@@ -1243,19 +1423,15 @@ async def admin_complete_callback(update: Update, context: ContextTypes.DEFAULT_
 def main():
     application = Application.builder().token(TOKEN).build()
 
-    # Command handler
+    # Global handlers
     application.add_handler(CommandHandler("start", start))
-
-    # Only standalone handler for Get Number (others are Conversations)
     application.add_handler(MessageHandler(filters.Regex("^Get Number$"), get_number_start))
-
-    # Callback query handlers
     application.add_handler(CallbackQueryHandler(get_main_callback, pattern="^get_main:"))
     application.add_handler(CallbackQueryHandler(get_sub_callback, pattern="^get_sub:"))
     application.add_handler(CallbackQueryHandler(change_number_callback, pattern="^change_number:"))
     application.add_handler(CallbackQueryHandler(admin_complete_callback, pattern="^admin_complete_"))
 
-    # Fake Name conversation – per_message=True to silence the warning
+    # Fake Name conversation — per_message=True OK here (only callback states)
     fake_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Fake Name$"), fake_name_start)],
         states={FAKE_GENDER: [CallbackQueryHandler(fake_gender_select, pattern="^fake_")]},
@@ -1264,90 +1440,101 @@ def main():
     )
     application.add_handler(fake_conv)
 
-    # Get 2FA conversation
+    # 2FA conversation — per_message=False (has text input state)
     get2fa_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Get 2FA$"), get2fa_start)],
         states={GET2FA_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, get2fa_generate)]},
         fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False,
     )
     application.add_handler(get2fa_conv)
 
-    # Admin Add/Remove Main Button
+    # Add/Remove Main Button conversation
     add_remove_main_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Add/Remove Main Button$"), add_remove_main)],
         states={
-            ADD_MAIN: [
-                MessageHandler(filters.Regex("^Add Main Button$"), add_main_prompt),
-                MessageHandler(filters.Regex("^Remove Main Button$"), remove_main_select),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_main_receive),
+            ADD_MAIN_MENU: [
+                MessageHandler(
+                    filters.Regex("^(Add Main Button|Remove Main Button|⬅️ Back)$"),
+                    add_remove_main_menu
+                )
             ],
-            REMOVE_MAIN_SELECT: [CallbackQueryHandler(remove_main_callback, pattern="^remove_main:|^cancel$")]
+            ADD_MAIN_RECEIVE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_main_receive)
+            ],
+            REMOVE_MAIN_SELECT: [
+                CallbackQueryHandler(remove_main_callback, pattern="^remove_main:|^cancel$")
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=True,
+        per_message=False,
     )
     application.add_handler(add_remove_main_conv)
 
-    # Admin Add/Remove Sub Button
+    # Add/Remove Sub Button conversation
     add_remove_sub_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Add/Remove Sub Button$"), add_remove_sub)],
         states={
-            ADD_SUB_MAIN_SELECT: [
-                MessageHandler(filters.Regex("^Add Sub Button$"), add_sub_main_select),
-                MessageHandler(filters.Regex("^Remove Sub Button$"), remove_sub_main_select),
+            ADD_SUB_MENU: [
+                MessageHandler(
+                    filters.Regex("^(Add Sub Button|Remove Sub Button|⬅️ Back)$"),
+                    add_remove_sub_menu
+                )
             ],
-            ADD_SUB_NAME: [
-                CallbackQueryHandler(add_sub_main_callback, pattern="^add_sub_main:|^cancel$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_sub_name_receive),
+            ADD_SUB_MAIN_SELECT: [
+                CallbackQueryHandler(add_sub_main_callback, pattern="^add_sub_main:|^cancel$")
+            ],
+            ADD_SUB_NAME_RECEIVE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_sub_name_receive)
+            ],
+            REMOVE_SUB_MAIN_SELECT: [
+                CallbackQueryHandler(remove_sub_main_callback, pattern="^remove_sub_main:|^cancel$")
             ],
             REMOVE_SUB_SELECT: [
-                CallbackQueryHandler(remove_sub_main_callback, pattern="^remove_sub_main:|^cancel$"),
-                CallbackQueryHandler(remove_sub_callback, pattern="^remove_sub:|^cancel$"),
-            ]
+                CallbackQueryHandler(remove_sub_callback, pattern="^remove_sub:|^cancel$")
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=True,
+        per_message=False,
     )
     application.add_handler(add_remove_sub_conv)
 
-    # Admin Broadcast
-    broadcast_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^📢 Broadcast$"), broadcast_start)],
-        states={
-            BROADCAST_RECEIVE: [MessageHandler(filters.ALL & ~filters.COMMAND, broadcast_receive)],
-            BROADCAST_CONFIRM: [CallbackQueryHandler(broadcast_confirm, pattern="^broadcast_")]
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=True,
-    )
-    application.add_handler(broadcast_conv)
-
-    # Profile conversation (includes upload states)
+    # Profile conversation — all flows unified, per_message=False for text input states
     profile_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^👤 My Profile$"), profile_start)],
         states={
             PROFILE_SELECT: [
-                MessageHandler(filters.Regex("^(💰 Balance|📋 Pending|✅ Approved|📋 Withdraw History|✏️ Edit|Upload|⬅️ Back)$"), profile_select),
+                MessageHandler(
+                    filters.Regex("^(💰 Balance|📋 Pending|✅ Approved|📋 Withdraw History|✏️ Edit|Upload|📢 Broadcast|⬅️ Back)$"),
+                    profile_select
+                ),
                 CallbackQueryHandler(profile_callback_handler, pattern="^(profile_set_wallet|profile_withdraw)$"),
+                CallbackQueryHandler(upload_main_callback, pattern="^upload_main:|^cancel_upload$"),
             ],
-            SET_WALLET_METHOD: [CallbackQueryHandler(wallet_method_select, pattern="^wallet_(bkash|rocket|binance)$")],
+            SET_WALLET_METHOD: [
+                CallbackQueryHandler(wallet_method_select, pattern="^wallet_(bkash|rocket|binance)$")
+            ],
             SET_WALLET_VALUE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, wallet_value_received),
-                CommandHandler("cancel", cancel)
+                CommandHandler("cancel", cancel),
             ],
-            WITHDRAW_METHOD: [CallbackQueryHandler(withdraw_method_select, pattern="^withdraw_method_(bkash|rocket|binance|mobile)$")],
+            WITHDRAW_METHOD: [
+                CallbackQueryHandler(withdraw_method_select, pattern="^withdraw_method_(bkash|rocket|binance|mobile)$")
+            ],
             WITHDRAW_AMOUNT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_amount_received),
-                CommandHandler("cancel", cancel)
+                CommandHandler("cancel", cancel),
             ],
-            EDIT_MENU: [MessageHandler(filters.Regex("^(Withdraw price|Rate|⬅️ Back)$"), edit_menu)],
+            EDIT_MENU: [
+                MessageHandler(filters.Regex("^(Withdraw price|Rate|⬅️ Back)$"), edit_menu)
+            ],
             EDIT_PRICE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_price_received),
-                CommandHandler("cancel", cancel)
+                CommandHandler("cancel", cancel),
             ],
             EDIT_RATE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_rate_received),
-                CommandHandler("cancel", cancel)
+                CommandHandler("cancel", cancel),
             ],
             UPLOAD_MAIN_SELECT: [
                 CallbackQueryHandler(upload_main_callback, pattern="^upload_main:|^cancel_upload$")
@@ -1358,25 +1545,28 @@ def main():
             UPLOAD_FILE: [
                 MessageHandler(filters.Document.ALL, upload_file_receive),
             ],
+            BROADCAST_RECEIVE: [
+                MessageHandler(filters.ALL & ~filters.COMMAND, broadcast_receive)
+            ],
+            BROADCAST_CONFIRM: [
+                CallbackQueryHandler(broadcast_confirm, pattern="^broadcast_")
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=True,
+        per_message=False,
     )
     application.add_handler(profile_conv)
 
-    # Background monitoring
     async def post_init(app: Application):
         if WEBHOOK_URL:
-            # Fix double slash: strip trailing slash from URL and add /webhook
             webhook_url = WEBHOOK_URL.rstrip('/') + '/webhook'
             await app.bot.set_webhook(url=webhook_url, secret_token=WEBHOOK_SECRET)
             logger.info(f"Webhook set to {webhook_url}")
-        # Launch monitoring loop as a background task
         app.create_task(monitoring_loop(app))
 
     application.post_init = post_init
 
-    logger.info("Starting webhook server...")
+    logger.info(f"Starting webhook server on port {PORT}...")
     application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
