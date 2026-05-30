@@ -7,6 +7,7 @@ import re
 import sqlite3
 import string
 import time
+import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Set
 
@@ -32,6 +33,10 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from telegram.warnings import PTBUserWarning
+
+# Suppress the per_message warning – it is safe for our use case
+warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 load_dotenv()
 
@@ -70,9 +75,14 @@ DB_FILE = "wallet.db"
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger("sms_otp_bot")
+
+# Reduce noise from httpx and other libraries
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 session = requests.Session()
 session.headers.update({
@@ -319,7 +329,6 @@ def login() -> bool:
         return False
     a, b = int(match.group(1)), int(match.group(2))
     answer = a + b
-    logger.info(f"CAPTCHA: {a} + {b} = {answer}")
     data = {"username": USERNAME, "password": PASSWORD, "capt": str(answer)}
     try:
         resp = session.post(SIGNIN_URL, data=data, allow_redirects=True, timeout=30)
@@ -327,10 +336,10 @@ def login() -> bool:
         logger.error(f"Login POST failed: {e}")
         return False
     if "Dashboard" in resp.text or "/agent/" in resp.url:
-        logger.info("Login successful.")
+        logger.info("✅ Login successful")
         return True
     else:
-        logger.error("Login failed.")
+        logger.error("Login failed")
         return False
 
 def fetch_data_sync() -> list | None:
@@ -349,31 +358,26 @@ def fetch_data_sync() -> list | None:
         try:
             resp = session.get(DATA_URL, params=params, timeout=30)
         except Exception as e:
-            logger.warning(f"Data request attempt {attempt+1} failed: {e}")
+            if attempt == INTERNAL_RETRIES - 1:
+                logger.error(f"Data request failed after {INTERNAL_RETRIES} attempts")
             time.sleep(2)
             continue
         if "login" in resp.url.lower():
-            logger.warning("Session expired.")
+            logger.warning("Session expired")
             return None
         if resp.status_code != 200:
-            logger.warning(f"Status {resp.status_code}")
             time.sleep(2)
             continue
         try:
             json_data = resp.json()
         except Exception:
-            logger.error(f"JSON decode failed. First 300 chars: {resp.text[:300]}")
-            if "login" in resp.text.lower() and "password" in resp.text.lower():
-                logger.warning("Response is login page.")
-                return None
+            logger.warning("JSON decode failed")
             time.sleep(2)
             continue
         rows = json_data.get("aaData")
         if rows is None:
-            logger.info("No 'aaData' in response.")
             return []
         return rows
-    logger.error("Data fetch failed after all retries.")
     return None
 
 async def fetch_data_async() -> list | None:
@@ -428,6 +432,7 @@ async def send_otp_to_group(bot: Bot, row: list, otp: str):
     ])
     try:
         await bot.send_message(GROUP_CHAT_ID, text, reply_markup=keyboard)
+        logger.info(f"OTP {otp} forwarded to group")
     except Exception as e:
         logger.error(f"Failed to send to group: {e}")
 
@@ -446,6 +451,7 @@ async def send_otp_to_user(bot: Bot, user_id: int, row: list, otp: str, old_bala
     ])
     try:
         await bot.send_message(user_id, text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+        logger.info(f"OTP {otp} sent to user {user_id}")
     except Exception as e:
         logger.error(f"Failed to send to user {user_id}: {e}")
 
@@ -455,7 +461,7 @@ async def send_otp_to_user(bot: Bot, user_id: int, row: list, otp: str, old_bala
 async def monitoring_loop(application: Application):
     bot = application.bot
     if not login():
-        logger.critical("Initial login failed.")
+        logger.critical("Initial login failed")
         return
     seen_pairs = load_seen_pairs()
     rows = await fetch_data_async()
@@ -471,17 +477,16 @@ async def monitoring_loop(application: Application):
             if pair not in seen_pairs:
                 seen_pairs.add(pair)
                 save_seen_pair(number, otp)
-        logger.info(f"Initialized with {len(seen_pairs)} seen pairs.")
+        logger.info(f"Monitoring started – {len(seen_pairs)} known OTPs")
     else:
-        logger.warning("Initial data fetch failed.")
+        logger.warning("Could not fetch initial data")
 
     consecutive_failures = 0
     while True:
         rows = await fetch_data_async()
         if rows is None:
-            logger.warning(f"Data fetch failed. Consecutive failures: {consecutive_failures+1}")
+            logger.warning(f"Data fetch failed ({consecutive_failures+1} consecutive)")
             if consecutive_failures == 0:
-                logger.info("Attempting re-login...")
                 if login():
                     consecutive_failures = 0
                 else:
@@ -489,7 +494,6 @@ async def monitoring_loop(application: Application):
             else:
                 consecutive_failures += 1
             backoff = RETRY_BACKOFF * min(consecutive_failures, 3)
-            logger.info(f"Waiting {backoff}s before retry.")
             await asyncio.sleep(backoff)
             continue
         consecutive_failures = 0
@@ -625,7 +629,7 @@ async def change_number_callback(update: Update, context: ContextTypes.DEFAULT_T
     _, main_name, sub_name = query.data.split(":",2)
     await assign_number_and_display(query, main_name, sub_name, user_id, context)
 
-# ── Fake Name flow (ConversationHandler only) ──
+# ── Fake Name flow ──
 FAKE_GENDER = 1
 
 async def fake_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -674,7 +678,7 @@ async def fake_gender_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
     return FAKE_GENDER
 
-# ── Get 2FA flow (ConversationHandler only) ──
+# ── Get 2FA flow ──
 GET2FA_SECRET = 1
 
 async def get2fa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -879,7 +883,7 @@ async def remove_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("Not found.")
     return ConversationHandler.END
 
-# ── Admin: Upload numbers (now replaces old pool) ──
+# ── Admin: Upload numbers ──
 UPLOAD_MAIN_SELECT, UPLOAD_SUB_SELECT, UPLOAD_FILE = range(100, 103)
 
 async def upload_from_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -939,14 +943,13 @@ async def upload_file_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
     sub_name = context.user_data["upload_sub"]
     pool_key = f"{main_name}_{sub_name}"
     pools = load_pools()
-    # Replace the entire pool instead of extending
     pools[pool_key] = numbers
     save_pools(pools)
 
     try:
         await update.message.bot.send_message(GROUP_CHAT_ID, f"{main_name}র {sub_name} নাম্বার যুক্ত করা হয়েছে।")
     except Exception as e:
-        logger.error(f"Broadcast upload notification failed: {e}")
+        logger.error(f"Upload notification failed: {e}")
 
     await update.message.reply_text(f"Added {len(numbers)} numbers to {main_name} / {sub_name}.", reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True))
     return ConversationHandler.END
@@ -1243,19 +1246,14 @@ async def admin_complete_callback(update: Update, context: ContextTypes.DEFAULT_
 def main():
     application = Application.builder().token(TOKEN).build()
 
-    # Command handler
     application.add_handler(CommandHandler("start", start))
-
-    # Only standalone handler for Get Number (others are Conversations)
     application.add_handler(MessageHandler(filters.Regex("^Get Number$"), get_number_start))
 
-    # Callback query handlers
     application.add_handler(CallbackQueryHandler(get_main_callback, pattern="^get_main:"))
     application.add_handler(CallbackQueryHandler(get_sub_callback, pattern="^get_sub:"))
     application.add_handler(CallbackQueryHandler(change_number_callback, pattern="^change_number:"))
     application.add_handler(CallbackQueryHandler(admin_complete_callback, pattern="^admin_complete_"))
 
-    # Fake Name conversation – per_message=True to silence the warning
     fake_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Fake Name$"), fake_name_start)],
         states={FAKE_GENDER: [CallbackQueryHandler(fake_gender_select, pattern="^fake_")]},
@@ -1264,7 +1262,6 @@ def main():
     )
     application.add_handler(fake_conv)
 
-    # Get 2FA conversation
     get2fa_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Get 2FA$"), get2fa_start)],
         states={GET2FA_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, get2fa_generate)]},
@@ -1272,7 +1269,6 @@ def main():
     )
     application.add_handler(get2fa_conv)
 
-    # Admin Add/Remove Main Button
     add_remove_main_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Add/Remove Main Button$"), add_remove_main)],
         states={
@@ -1288,7 +1284,6 @@ def main():
     )
     application.add_handler(add_remove_main_conv)
 
-    # Admin Add/Remove Sub Button
     add_remove_sub_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Add/Remove Sub Button$"), add_remove_sub)],
         states={
@@ -1310,7 +1305,6 @@ def main():
     )
     application.add_handler(add_remove_sub_conv)
 
-    # Admin Broadcast
     broadcast_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📢 Broadcast$"), broadcast_start)],
         states={
@@ -1322,7 +1316,6 @@ def main():
     )
     application.add_handler(broadcast_conv)
 
-    # Profile conversation (includes upload states)
     profile_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^👤 My Profile$"), profile_start)],
         states={
@@ -1364,14 +1357,11 @@ def main():
     )
     application.add_handler(profile_conv)
 
-    # Background monitoring
     async def post_init(app: Application):
         if WEBHOOK_URL:
-            # Fix double slash: strip trailing slash from URL and add /webhook
             webhook_url = WEBHOOK_URL.rstrip('/') + '/webhook'
             await app.bot.set_webhook(url=webhook_url, secret_token=WEBHOOK_SECRET)
             logger.info(f"Webhook set to {webhook_url}")
-        # Launch monitoring loop as a background task
         app.create_task(monitoring_loop(app))
 
     application.post_init = post_init
