@@ -1,4 +1,4 @@
-python-telegram-bot==21.6
+python-telegram-bot[webhooks]==21.6
 requests==2.32.3
 python-dotenv==1.0.1
 Faker==26.0.0
