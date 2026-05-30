@@ -1255,11 +1255,12 @@ def main():
     application.add_handler(CallbackQueryHandler(change_number_callback, pattern="^change_number:"))
     application.add_handler(CallbackQueryHandler(admin_complete_callback, pattern="^admin_complete_"))
 
-    # Fake Name conversation
+    # Fake Name conversation – per_message=True to silence the warning
     fake_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Fake Name$"), fake_name_start)],
         states={FAKE_GENDER: [CallbackQueryHandler(fake_gender_select, pattern="^fake_")]},
         fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=True,
     )
     application.add_handler(fake_conv)
 
@@ -1283,6 +1284,7 @@ def main():
             REMOVE_MAIN_SELECT: [CallbackQueryHandler(remove_main_callback, pattern="^remove_main:|^cancel$")]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=True,
     )
     application.add_handler(add_remove_main_conv)
 
@@ -1304,6 +1306,7 @@ def main():
             ]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=True,
     )
     application.add_handler(add_remove_sub_conv)
 
@@ -1315,6 +1318,7 @@ def main():
             BROADCAST_CONFIRM: [CallbackQueryHandler(broadcast_confirm, pattern="^broadcast_")]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=True,
     )
     application.add_handler(broadcast_conv)
 
@@ -1356,14 +1360,18 @@ def main():
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=True,
     )
     application.add_handler(profile_conv)
 
     # Background monitoring
     async def post_init(app: Application):
         if WEBHOOK_URL:
-            await app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook", secret_token=WEBHOOK_SECRET)
-            logger.info(f"Webhook set to {WEBHOOK_URL}/webhook")
+            # Fix double slash: strip trailing slash from URL and add /webhook
+            webhook_url = WEBHOOK_URL.rstrip('/') + '/webhook'
+            await app.bot.set_webhook(url=webhook_url, secret_token=WEBHOOK_SECRET)
+            logger.info(f"Webhook set to {webhook_url}")
+        # Launch monitoring loop as a background task
         app.create_task(monitoring_loop(app))
 
     application.post_init = post_init
@@ -1374,7 +1382,7 @@ def main():
         port=PORT,
         url_path="webhook",
         secret_token=WEBHOOK_SECRET,
-        webhook_url=f"{WEBHOOK_URL}/webhook" if WEBHOOK_URL else None,
+        webhook_url=WEBHOOK_URL.rstrip('/') + '/webhook' if WEBHOOK_URL else None,
     )
 
 if __name__ == "__main__":
