@@ -52,6 +52,11 @@ CHECK_INTERVAL = 5
 INTERNAL_RETRIES = 3
 RETRY_BACKOFF = 15
 
+# Railway webhook settings
+WEBHOOK_URL = os.getenv("BOT_WEBHOOK_URL")
+WEBHOOK_SECRET = os.getenv("BOT_WEBHOOK_SECRET", os.urandom(16).hex())
+PORT = int(os.getenv("PORT", "8443"))
+
 # JSON data files
 MAIN_BUTTONS_FILE = "main_buttons.json"
 SUB_BUTTONS_FILE = "sub_buttons.json"
@@ -620,13 +625,13 @@ async def change_number_callback(update: Update, context: ContextTypes.DEFAULT_T
     _, main_name, sub_name = query.data.split(":",2)
     await assign_number_and_display(query, main_name, sub_name, user_id, context)
 
-# ── Fake Name flow ──
+# ── Fake Name flow (ConversationHandler only) ──
 FAKE_GENDER = 1
 
 async def fake_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_banned(update.effective_user.id):
         await update.message.reply_text("🚫 Banned.")
-        return
+        return ConversationHandler.END
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("👨 Male", callback_data="fake_male"),
          InlineKeyboardButton("👩 Female", callback_data="fake_female")]
@@ -669,13 +674,13 @@ async def fake_gender_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
     return FAKE_GENDER
 
-# ── Get 2FA flow (with copy button) ──
+# ── Get 2FA flow (ConversationHandler only) ──
 GET2FA_SECRET = 1
 
 async def get2fa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_banned(update.effective_user.id):
         await update.message.reply_text("🚫 Banned.")
-        return
+        return ConversationHandler.END
     await update.message.reply_text(
         "📲 <b>Paste your 2FA Secret Key</b>\n\n"
         "<i>Example: JBSWY3DPEHPK3PXP</i>",
@@ -874,7 +879,7 @@ async def remove_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("Not found.")
     return ConversationHandler.END
 
-# ── Admin: Upload numbers (integrated inside profile) ──
+# ── Admin: Upload numbers (now replaces old pool) ──
 UPLOAD_MAIN_SELECT, UPLOAD_SUB_SELECT, UPLOAD_FILE = range(100, 103)
 
 async def upload_from_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -934,9 +939,8 @@ async def upload_file_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
     sub_name = context.user_data["upload_sub"]
     pool_key = f"{main_name}_{sub_name}"
     pools = load_pools()
-    if pool_key not in pools:
-        pools[pool_key] = []
-    pools[pool_key].extend(numbers)
+    # Replace the entire pool instead of extending
+    pools[pool_key] = numbers
     save_pools(pools)
 
     try:
@@ -1242,10 +1246,8 @@ def main():
     # Command handler
     application.add_handler(CommandHandler("start", start))
 
-    # Standalone keyboard button handlers
+    # Only standalone handler for Get Number (others are Conversations)
     application.add_handler(MessageHandler(filters.Regex("^Get Number$"), get_number_start))
-    application.add_handler(MessageHandler(filters.Regex("^Fake Name$"), fake_name_start))
-    application.add_handler(MessageHandler(filters.Regex("^Get 2FA$"), get2fa_start))
 
     # Callback query handlers
     application.add_handler(CallbackQueryHandler(get_main_callback, pattern="^get_main:"))
@@ -1269,7 +1271,7 @@ def main():
     )
     application.add_handler(get2fa_conv)
 
-    # Admin Add/Remove Main Button (inside profile)
+    # Admin Add/Remove Main Button
     add_remove_main_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Add/Remove Main Button$"), add_remove_main)],
         states={
@@ -1284,7 +1286,7 @@ def main():
     )
     application.add_handler(add_remove_main_conv)
 
-    # Admin Add/Remove Sub Button (inside profile)
+    # Admin Add/Remove Sub Button
     add_remove_sub_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Add/Remove Sub Button$"), add_remove_sub)],
         states={
@@ -1305,7 +1307,7 @@ def main():
     )
     application.add_handler(add_remove_sub_conv)
 
-    # Admin Broadcast (inside profile)
+    # Admin Broadcast
     broadcast_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📢 Broadcast$"), broadcast_start)],
         states={
@@ -1351,7 +1353,6 @@ def main():
             ],
             UPLOAD_FILE: [
                 MessageHandler(filters.Document.ALL, upload_file_receive),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: upload_file_receive(u, c))  # fallback for non-file
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -1360,11 +1361,21 @@ def main():
 
     # Background monitoring
     async def post_init(app: Application):
+        if WEBHOOK_URL:
+            await app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook", secret_token=WEBHOOK_SECRET)
+            logger.info(f"Webhook set to {WEBHOOK_URL}/webhook")
         app.create_task(monitoring_loop(app))
+
     application.post_init = post_init
 
-    logger.info("Bot started. Polling...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Starting webhook server...")
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path="webhook",
+        secret_token=WEBHOOK_SECRET,
+        webhook_url=f"{WEBHOOK_URL}/webhook" if WEBHOOK_URL else None,
+    )
 
 if __name__ == "__main__":
     main()
