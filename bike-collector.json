@@ -1,0 +1,270 @@
+{
+  "name": "Bikes 2025 – Google Sheets DB",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "bikes",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [250, 300],
+      "webhookId": "bike-webhook"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.query.action }}",
+                    "rightValue": "collect",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "id": "switch-action",
+      "name": "Check ?action=collect",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "name": "bikes",
+              "value": [
+                {
+                  "model_name": "Bajaj Pulsar NS400Z",
+                  "brand": "Bajaj",
+                  "detail_page_url": "https://www.bikewale.com/bajaj-bikes/pulsar-ns400z/"
+                },
+                {
+                  "model_name": "Royal Enfield Himalayan 450",
+                  "brand": "Royal Enfield",
+                  "detail_page_url": "https://www.bikewale.com/royalenfield-bikes/himalayan-450/"
+                },
+                {
+                  "model_name": "Kawasaki Ninja 500",
+                  "brand": "Kawasaki",
+                  "detail_page_url": "https://www.bikewale.com/kawasaki-bikes/ninja-500/"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "id": "bike-list",
+      "name": "Bike List",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [650, 250]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "split-batches",
+      "name": "One by One",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [850, 250]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.detail_page_url }}",
+        "sendHeaders": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0"
+            }
+          ]
+        }
+      },
+      "id": "fetch-page",
+      "name": "Fetch Page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1050, 250]
+    },
+    {
+      "parameters": {
+        "sourceData": "html",
+        "extractionValues": {
+          "values": [
+            {
+              "key": "engine",
+              "cssSelector": ".bike-specs .engine span",
+              "returnValue": "text"
+            },
+            {
+              "key": "power",
+              "cssSelector": ".bike-specs .max-power span",
+              "returnValue": "text"
+            },
+            {
+              "key": "price",
+              "cssSelector": ".bike-price .amount",
+              "returnValue": "text"
+            }
+          ]
+        }
+      },
+      "id": "extract-specs",
+      "name": "Extract Specs",
+      "type": "n8n-nodes-base.htmlExtract",
+      "typeVersion": 1,
+      "position": [1250, 250]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "name": "model_name",
+              "value": "={{ $json.model_name }}"
+            },
+            {
+              "name": "brand",
+              "value": "={{ $json.brand }}"
+            },
+            {
+              "name": "release_year",
+              "value": "2025"
+            },
+            {
+              "name": "engine",
+              "value": "={{ $json.engine }}"
+            },
+            {
+              "name": "power_hp",
+              "value": "={{ $json.power }}"
+            },
+            {
+              "name": "price",
+              "value": "={{ $json.price }}"
+            },
+            {
+              "name": "source_url",
+              "value": "={{ $json.detail_page_url }}"
+            }
+          ]
+        }
+      },
+      "id": "clean-data",
+      "name": "Clean Data",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1450, 250]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "sheetId": "YOUR_GOOGLE_SHEET_ID",
+        "range": "Sheet1!A:G",
+        "options": {}
+      },
+      "id": "append-to-sheet",
+      "name": "Append to Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 2,
+      "position": [1650, 250],
+      "credentials": {
+        "googleSheetsOAuth2Api": "Google Sheets account"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "sheetId": "YOUR_GOOGLE_SHEET_ID",
+        "range": "Sheet1!A:G",
+        "options": {}
+      },
+      "id": "read-sheet",
+      "name": "Read Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 2,
+      "position": [650, 500],
+      "credentials": {
+        "googleSheetsOAuth2Api": "Google Sheets account"
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "name": "data",
+              "value": "={{ $input.all().map(row => row.json) }}"
+            },
+            {
+              "name": "count",
+              "value": "={{ $input.all().length }}"
+            }
+          ]
+        }
+      },
+      "id": "format-response",
+      "name": "Format Response",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [850, 500]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[ { "node": "Check ?action=collect", "type": "main", "index": 0 } ]]
+    },
+    "Check ?action=collect": {
+      "main": [
+        [ { "node": "Bike List", "type": "main", "index": 0 } ],
+        [ { "node": "Read Sheet", "type": "main", "index": 0 } ]
+      ]
+    },
+    "Bike List": {
+      "main": [[ { "node": "One by One", "type": "main", "index": 0 } ]]
+    },
+    "One by One": {
+      "main": [[ { "node": "Fetch Page", "type": "main", "index": 0 } ]]
+    },
+    "Fetch Page": {
+      "main": [[ { "node": "Extract Specs", "type": "main", "index": 0 } ]]
+    },
+    "Extract Specs": {
+      "main": [[ { "node": "Clean Data", "type": "main", "index": 0 } ]]
+    },
+    "Clean Data": {
+      "main": [[ { "node": "Append to Sheet", "type": "main", "index": 0 } ]]
+    },
+    "Read Sheet": {
+      "main": [[ { "node": "Format Response", "type": "main", "index": 0 } ]]
+    }
+  },
+  "settings": { "timezone": "UTC" },
+  "staticData": null,
+  "versionId": "1.0.0",
+  "id": "bikes-gsheets",
+  "pinData": {}
+}
