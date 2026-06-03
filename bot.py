@@ -5,7 +5,6 @@ import os
 import random
 import re
 import sqlite3
-import ssl
 import string
 import time
 import warnings
@@ -39,6 +38,7 @@ from telegram.ext import (
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Suppress all UserWarnings (including the per_message ones)
 warnings.filterwarnings("ignore", category=UserWarning)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext").setLevel(logging.WARNING)
@@ -51,6 +51,7 @@ GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
 # Multiple admins: comma-separated list of user IDs
 admin_ids_str = os.getenv("ADMIN_CHAT_IDS", "")
 ADMIN_CHAT_IDS = {int(x.strip()) for x in admin_ids_str.split(",") if x.strip().isdigit()}
+# Fallback to old single ADMIN_CHAT_ID if ADMIN_CHAT_IDS not set
 if not ADMIN_CHAT_IDS:
     single_admin = os.getenv("ADMIN_CHAT_ID")
     if single_admin:
@@ -68,7 +69,7 @@ SITE2_API_URL = os.getenv("SITE2_API_URL", "http://147.135.212.197/crapi/had/vie
 SITE2_API_TOKEN = os.getenv("SITE2_API_TOKEN", "")
 SITE2_CHECK_INTERVAL = int(os.getenv("SITE2_CHECK_INTERVAL", "18"))
 
-# Site 3 (SSL issues – custom SSL context)
+# Site 3 (SSL issues -> verify=False and custom ciphers)
 SITE3_BASE_URL = os.getenv("SITE3_BASE_URL", "https://nexor-iprn.com")
 SITE3_USERNAME = os.getenv("SITE3_USERNAME", "")
 SITE3_PASSWORD = os.getenv("SITE3_PASSWORD", "")
@@ -103,16 +104,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("sms_otp_bot")
 
-# --- Create a custom SSL context that allows older TLS versions ---
-def create_ssl_context():
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    ctx.minimum_version = ssl.TLSVersion.TLSv1
-    ctx.set_ciphers('DEFAULT:@SECLEVEL=1')
-    return ctx
+# --- SSL workaround for Site3 ---
+try:
+    requests.packages.urllib3.util.ssl_.DEFAULT_CIPHERS = 'ALL:@SECLEVEL=1'
+except Exception:
+    pass
 
-# --- Sessions ---
+# Sessions
 session1 = requests.Session()
 session1.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -124,17 +122,8 @@ session1.headers.update({
     "Cache-Control": "no-cache",
 })
 
-# Custom adapter for session3 to handle SSL errors
-from requests.adapters import HTTPAdapter
-
-class SSLAdapter(HTTPAdapter):
-    def init_poolmanager(self, *args, **kwargs):
-        kwargs['ssl_context'] = create_ssl_context()
-        return super().init_poolmanager(*args, **kwargs)
-
 session3 = requests.Session()
-session3.verify = False
-session3.mount('https://', SSLAdapter())
+session3.verify = False                                  # Disable SSL verification for Site3
 session3.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -445,7 +434,7 @@ def site_login(session, base_url, username, password, retries=3) -> bool:
     return False
 
 # ----------------------------------------------------------------------
-# Data fetchers
+# Site 1 data fetcher
 # ----------------------------------------------------------------------
 def fetch_data_sync_site1(session) -> Optional[list]:
     base_url = SITE1_BASE_URL
@@ -495,6 +484,9 @@ def fetch_data_sync_site1(session) -> Optional[list]:
 async def fetch_data_async_site1(session) -> Optional[list]:
     return await asyncio.to_thread(fetch_data_sync_site1, session)
 
+# ----------------------------------------------------------------------
+# Site 2 API fetcher
+# ----------------------------------------------------------------------
 def fetch_data_sync_site2_api() -> Optional[list]:
     token = SITE2_API_TOKEN
     if not token:
@@ -582,6 +574,9 @@ def fetch_data_sync_site2_api() -> Optional[list]:
 async def fetch_data_async_site2_api() -> Optional[list]:
     return await asyncio.to_thread(fetch_data_sync_site2_api)
 
+# ----------------------------------------------------------------------
+# Site 3 data fetcher (unchanged, uses session3 with verify=False)
+# ----------------------------------------------------------------------
 def fetch_data_sync_site3(session) -> Optional[list]:
     base_url = SITE3_BASE_URL
     today = datetime.now()
@@ -630,6 +625,9 @@ def fetch_data_sync_site3(session) -> Optional[list]:
 async def fetch_data_async_site3(session) -> Optional[list]:
     return await asyncio.to_thread(fetch_data_sync_site3, session)
 
+# ----------------------------------------------------------------------
+# Site 4 helpers
+# ----------------------------------------------------------------------
 def get_site4_data_url(session, base_url) -> Optional[str]:
     stats_url = f"{base_url}/agent/SMSCDRStats"
     try:
@@ -775,7 +773,7 @@ async def send_otp_to_user(bot: Bot, user_id: int, row: list, otp: str,
         logger.error(f"Failed to send to user {user_id}: {e}")
 
 # ----------------------------------------------------------------------
-# Monitors – with per‑loop exception handling to prevent silent death
+# Monitors (unchanged)
 # ----------------------------------------------------------------------
 async def monitor_site1(application: Application):
     session = session1
@@ -810,62 +808,58 @@ async def monitor_site1(application: Application):
 
     consecutive_failures = 0
     while True:
-        try:
-            rows = await fetch_data_async_site1(session)
-            if rows is None:
-                logger.warning(f"[{label}] Data fetch failed. Re‑login required.")
-                if site_login(session, base_url, username, password):
-                    logger.info(f"[{label}] Re‑login succeeded. Retrying fetch...")
-                    rows = await fetch_data_async_site1(session)
-                    if rows is not None:
-                        consecutive_failures = 0
-                    else:
-                        consecutive_failures += 1
+        rows = await fetch_data_async_site1(session)
+        if rows is None:
+            logger.warning(f"[{label}] Data fetch failed. Re‑login required.")
+            if site_login(session, base_url, username, password):
+                logger.info(f"[{label}] Re‑login succeeded. Retrying fetch...")
+                rows = await fetch_data_async_site1(session)
+                if rows is not None:
+                    consecutive_failures = 0
                 else:
                     consecutive_failures += 1
-                if rows is None:
-                    backoff = min(RETRY_BACKOFF * consecutive_failures, MAX_BACKOFF)
-                    logger.info(f"[{label}] Waiting {backoff}s before next attempt.")
-                    await asyncio.sleep(backoff)
-                    continue
             else:
-                consecutive_failures = 0
+                consecutive_failures += 1
+            if rows is None:
+                backoff = min(RETRY_BACKOFF * consecutive_failures, MAX_BACKOFF)
+                logger.info(f"[{label}] Waiting {backoff}s before next attempt.")
+                await asyncio.sleep(backoff)
+                continue
+        else:
+            consecutive_failures = 0
 
-            assigned = load_assigned()
-            normalised_assigned = {normalise_number(k): v for k, v in assigned.items()}
-            per_otp = float(get_setting("per_otp_bdt", "0.30"))
-            new_otp_count = 0
-            for row in rows:
-                if len(row) < 9: continue
-                sms_text = str(row[5])
-                if "#" not in sms_text: continue
-                otp = extract_otp(sms_text)
-                if not otp: continue
-                number = str(row[2]).strip()
-                pair = f"{number}|{otp}"
-                if pair in seen_pairs:
-                    continue
-                seen_pairs.add(pair)
-                save_seen_pair(seen_file, number, otp)
-                new_otp_count += 1
+        assigned = load_assigned()
+        normalised_assigned = {normalise_number(k): v for k, v in assigned.items()}
+        per_otp = float(get_setting("per_otp_bdt", "0.30"))
+        new_otp_count = 0
+        for row in rows:
+            if len(row) < 9: continue
+            sms_text = str(row[5])
+            if "#" not in sms_text: continue
+            otp = extract_otp(sms_text)
+            if not otp: continue
+            number = str(row[2]).strip()
+            pair = f"{number}|{otp}"
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            save_seen_pair(seen_file, number, otp)
+            new_otp_count += 1
 
-                assign_data = normalised_assigned.get(normalise_number(number), {})
-                user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
-                country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
+            assign_data = normalised_assigned.get(normalise_number(number), {})
+            user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
+            country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
 
-                tasks = [send_otp_to_group(bot, row, otp, country=country)]
-                if user_id:
-                    old_balance = get_user_balance(user_id)
-                    credit_user(user_id, per_otp)
-                    new_balance = get_user_balance(user_id)
-                    tasks.append(send_otp_to_user(bot, user_id, row, otp, old_balance, new_balance, country=country))
-                await asyncio.gather(*tasks)
-            if new_otp_count > 0:
-                logger.info(f"[{label}] 📨 {new_otp_count} new OTP(s) processed.")
-            await asyncio.sleep(check_interval)
-        except Exception as e:
-            logger.error(f"[{label}] Unexpected error in monitor loop: {e}", exc_info=True)
-            await asyncio.sleep(5)
+            tasks = [send_otp_to_group(bot, row, otp, country=country)]
+            if user_id:
+                old_balance = get_user_balance(user_id)
+                credit_user(user_id, per_otp)
+                new_balance = get_user_balance(user_id)
+                tasks.append(send_otp_to_user(bot, user_id, row, otp, old_balance, new_balance, country=country))
+            await asyncio.gather(*tasks)
+        if new_otp_count > 0:
+            logger.info(f"[{label}] 📨 {new_otp_count} new OTP(s) processed.")
+        await asyncio.sleep(check_interval)
 
 async def monitor_site2(application: Application):
     seen_file = "seen_pairs_site2.txt"
@@ -893,57 +887,53 @@ async def monitor_site2(application: Application):
 
     consecutive_failures = 0
     while True:
-        try:
-            rows = await fetch_data_async_site2_api()
-            if rows is None:
-                consecutive_failures += 1
-                backoff = min(RETRY_BACKOFF * consecutive_failures, MAX_BACKOFF)
-                logger.warning(f"[{label}] API fetch failed. Consecutive: {consecutive_failures}. Waiting {backoff}s.")
-                await asyncio.sleep(backoff)
+        rows = await fetch_data_async_site2_api()
+        if rows is None:
+            consecutive_failures += 1
+            backoff = min(RETRY_BACKOFF * consecutive_failures, MAX_BACKOFF)
+            logger.warning(f"[{label}] API fetch failed. Consecutive: {consecutive_failures}. Waiting {backoff}s.")
+            await asyncio.sleep(backoff)
+            continue
+        else:
+            consecutive_failures = 0
+
+        assigned = load_assigned()
+        normalised_assigned = {normalise_number(k): v for k, v in assigned.items()}
+        per_otp = float(get_setting("per_otp_bdt", "0.30"))
+        new_otp_count = 0
+        for row in rows:
+            if len(row) < 9: continue
+            sms_text = str(row[5])
+            if "#" not in sms_text: continue
+            otp = extract_otp(sms_text)
+            if not otp: continue
+            number = str(row[2]).strip()
+            if not number:
                 continue
-            else:
-                consecutive_failures = 0
+            pair = f"{number}|{otp}"
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            save_seen_pair(seen_file, number, otp)
+            new_otp_count += 1
 
-            assigned = load_assigned()
-            normalised_assigned = {normalise_number(k): v for k, v in assigned.items()}
-            per_otp = float(get_setting("per_otp_bdt", "0.30"))
-            new_otp_count = 0
-            for row in rows:
-                if len(row) < 9: continue
-                sms_text = str(row[5])
-                if "#" not in sms_text: continue
-                otp = extract_otp(sms_text)
-                if not otp: continue
-                number = str(row[2]).strip()
-                if not number:
-                    continue
-                pair = f"{number}|{otp}"
-                if pair in seen_pairs:
-                    continue
-                seen_pairs.add(pair)
-                save_seen_pair(seen_file, number, otp)
-                new_otp_count += 1
+            assign_data = normalised_assigned.get(normalise_number(number), {})
+            user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
+            country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
 
-                assign_data = normalised_assigned.get(normalise_number(number), {})
-                user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
-                country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
-
-                tasks = [send_otp_to_group(bot, row, otp, country=country)]
-                if user_id:
-                    old_balance = get_user_balance(user_id)
-                    credit_user(user_id, per_otp)
-                    new_balance = get_user_balance(user_id)
-                    tasks.append(send_otp_to_user(bot, user_id, row, otp, old_balance, new_balance, country=country))
-                await asyncio.gather(*tasks)
-            if new_otp_count > 0:
-                logger.info(f"[{label}] 📨 {new_otp_count} new OTP(s) processed.")
-            await asyncio.sleep(check_interval)
-        except Exception as e:
-            logger.error(f"[{label}] Unexpected error in monitor loop: {e}", exc_info=True)
-            await asyncio.sleep(5)
+            tasks = [send_otp_to_group(bot, row, otp, country=country)]
+            if user_id:
+                old_balance = get_user_balance(user_id)
+                credit_user(user_id, per_otp)
+                new_balance = get_user_balance(user_id)
+                tasks.append(send_otp_to_user(bot, user_id, row, otp, old_balance, new_balance, country=country))
+            await asyncio.gather(*tasks)
+        if new_otp_count > 0:
+            logger.info(f"[{label}] 📨 {new_otp_count} new OTP(s) processed.")
+        await asyncio.sleep(check_interval)
 
 async def monitor_site3(application: Application):
-    session = session3  # SSL workaround already applied
+    session = session3  # verify=False already set
     base_url = SITE3_BASE_URL
     username = SITE3_USERNAME
     password = SITE3_PASSWORD
@@ -975,62 +965,58 @@ async def monitor_site3(application: Application):
 
     consecutive_failures = 0
     while True:
-        try:
-            rows = await fetch_data_async_site3(session)
-            if rows is None:
-                logger.warning(f"[{label}] Data fetch failed. Re‑login required.")
-                if site_login(session, base_url, username, password):
-                    logger.info(f"[{label}] Re‑login succeeded. Retrying fetch...")
-                    rows = await fetch_data_async_site3(session)
-                    if rows is not None:
-                        consecutive_failures = 0
-                    else:
-                        consecutive_failures += 1
+        rows = await fetch_data_async_site3(session)
+        if rows is None:
+            logger.warning(f"[{label}] Data fetch failed. Re‑login required.")
+            if site_login(session, base_url, username, password):
+                logger.info(f"[{label}] Re‑login succeeded. Retrying fetch...")
+                rows = await fetch_data_async_site3(session)
+                if rows is not None:
+                    consecutive_failures = 0
                 else:
                     consecutive_failures += 1
-                if rows is None:
-                    backoff = min(RETRY_BACKOFF * consecutive_failures, MAX_BACKOFF)
-                    logger.info(f"[{label}] Waiting {backoff}s before next attempt.")
-                    await asyncio.sleep(backoff)
-                    continue
             else:
-                consecutive_failures = 0
+                consecutive_failures += 1
+            if rows is None:
+                backoff = min(RETRY_BACKOFF * consecutive_failures, MAX_BACKOFF)
+                logger.info(f"[{label}] Waiting {backoff}s before next attempt.")
+                await asyncio.sleep(backoff)
+                continue
+        else:
+            consecutive_failures = 0
 
-            assigned = load_assigned()
-            normalised_assigned = {normalise_number(k): v for k, v in assigned.items()}
-            per_otp = float(get_setting("per_otp_bdt", "0.30"))
-            new_otp_count = 0
-            for row in rows:
-                if len(row) < 9: continue
-                sms_text = str(row[5])
-                if "#" not in sms_text: continue
-                otp = extract_otp(sms_text)
-                if not otp: continue
-                number = str(row[2]).strip()
-                pair = f"{number}|{otp}"
-                if pair in seen_pairs:
-                    continue
-                seen_pairs.add(pair)
-                save_seen_pair(seen_file, number, otp)
-                new_otp_count += 1
+        assigned = load_assigned()
+        normalised_assigned = {normalise_number(k): v for k, v in assigned.items()}
+        per_otp = float(get_setting("per_otp_bdt", "0.30"))
+        new_otp_count = 0
+        for row in rows:
+            if len(row) < 9: continue
+            sms_text = str(row[5])
+            if "#" not in sms_text: continue
+            otp = extract_otp(sms_text)
+            if not otp: continue
+            number = str(row[2]).strip()
+            pair = f"{number}|{otp}"
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            save_seen_pair(seen_file, number, otp)
+            new_otp_count += 1
 
-                assign_data = normalised_assigned.get(normalise_number(number), {})
-                user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
-                country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
+            assign_data = normalised_assigned.get(normalise_number(number), {})
+            user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
+            country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
 
-                tasks = [send_otp_to_group(bot, row, otp, country=country)]
-                if user_id:
-                    old_balance = get_user_balance(user_id)
-                    credit_user(user_id, per_otp)
-                    new_balance = get_user_balance(user_id)
-                    tasks.append(send_otp_to_user(bot, user_id, row, otp, old_balance, new_balance, country=country))
-                await asyncio.gather(*tasks)
-            if new_otp_count > 0:
-                logger.info(f"[{label}] 📨 {new_otp_count} new OTP(s) processed.")
-            await asyncio.sleep(check_interval)
-        except Exception as e:
-            logger.error(f"[{label}] Unexpected error in monitor loop: {e}", exc_info=True)
-            await asyncio.sleep(5)
+            tasks = [send_otp_to_group(bot, row, otp, country=country)]
+            if user_id:
+                old_balance = get_user_balance(user_id)
+                credit_user(user_id, per_otp)
+                new_balance = get_user_balance(user_id)
+                tasks.append(send_otp_to_user(bot, user_id, row, otp, old_balance, new_balance, country=country))
+            await asyncio.gather(*tasks)
+        if new_otp_count > 0:
+            logger.info(f"[{label}] 📨 {new_otp_count} new OTP(s) processed.")
+        await asyncio.sleep(check_interval)
 
 async def monitor_site4(application: Application):
     session = session4
@@ -1069,71 +1055,67 @@ async def monitor_site4(application: Application):
 
     consecutive_failures = 0
     while True:
-        try:
-            if not data_url:
-                logger.info(f"[{label}] Data URL missing, attempting re‑login.")
-                if site_login(session, base_url, username, password):
-                    data_url = get_site4_data_url(session, base_url)
-                    if data_url:
-                        consecutive_failures = 0
-                        logger.info(f"[{label}] Re‑login and URL extraction successful.")
-                    else:
-                        consecutive_failures += 1
+        if not data_url:
+            logger.info(f"[{label}] Data URL missing, attempting re‑login.")
+            if site_login(session, base_url, username, password):
+                data_url = get_site4_data_url(session, base_url)
+                if data_url:
+                    consecutive_failures = 0
+                    logger.info(f"[{label}] Re‑login and URL extraction successful.")
                 else:
                     consecutive_failures += 1
-                if not data_url:
-                    backoff = min(RETRY_BACKOFF * consecutive_failures, MAX_BACKOFF)
-                    logger.info(f"[{label}] Still no data URL. Waiting {backoff}s.")
-                    await asyncio.sleep(backoff)
-                    continue
-
-            rows = await fetch_data_async_site4(session, data_url)
-            if rows is None:
-                logger.warning(f"[{label}] Data fetch failed. Invalidating data URL.")
-                data_url = None
+            else:
                 consecutive_failures += 1
+            if not data_url:
                 backoff = min(RETRY_BACKOFF * consecutive_failures, MAX_BACKOFF)
-                logger.info(f"[{label}] Waiting {backoff}s before next attempt.")
+                logger.info(f"[{label}] Still no data URL. Waiting {backoff}s.")
                 await asyncio.sleep(backoff)
                 continue
-            else:
-                consecutive_failures = 0
 
-            assigned = load_assigned()
-            normalised_assigned = {normalise_number(k): v for k, v in assigned.items()}
-            per_otp = float(get_setting("per_otp_bdt", "0.30"))
-            new_otp_count = 0
-            for row in rows:
-                if len(row) < 9: continue
-                sms_text = str(row[5])
-                if "#" not in sms_text: continue
-                otp = extract_otp(sms_text)
-                if not otp: continue
-                number = str(row[2]).strip()
-                pair = f"{number}|{otp}"
-                if pair in seen_pairs:
-                    continue
-                seen_pairs.add(pair)
-                save_seen_pair(seen_file, number, otp)
-                new_otp_count += 1
+        rows = await fetch_data_async_site4(session, data_url)
+        if rows is None:
+            logger.warning(f"[{label}] Data fetch failed. Invalidating data URL.")
+            data_url = None
+            consecutive_failures += 1
+            backoff = min(RETRY_BACKOFF * consecutive_failures, MAX_BACKOFF)
+            logger.info(f"[{label}] Waiting {backoff}s before next attempt.")
+            await asyncio.sleep(backoff)
+            continue
+        else:
+            consecutive_failures = 0
 
-                assign_data = normalised_assigned.get(normalise_number(number), {})
-                user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
-                country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
+        assigned = load_assigned()
+        normalised_assigned = {normalise_number(k): v for k, v in assigned.items()}
+        per_otp = float(get_setting("per_otp_bdt", "0.30"))
+        new_otp_count = 0
+        for row in rows:
+            if len(row) < 9: continue
+            sms_text = str(row[5])
+            if "#" not in sms_text: continue
+            otp = extract_otp(sms_text)
+            if not otp: continue
+            number = str(row[2]).strip()
+            pair = f"{number}|{otp}"
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            save_seen_pair(seen_file, number, otp)
+            new_otp_count += 1
 
-                tasks = [send_otp_to_group(bot, row, otp, country=country)]
-                if user_id:
-                    old_balance = get_user_balance(user_id)
-                    credit_user(user_id, per_otp)
-                    new_balance = get_user_balance(user_id)
-                    tasks.append(send_otp_to_user(bot, user_id, row, otp, old_balance, new_balance, country=country))
-                await asyncio.gather(*tasks)
-            if new_otp_count > 0:
-                logger.info(f"[{label}] 📨 {new_otp_count} new OTP(s) processed.")
-            await asyncio.sleep(check_interval)
-        except Exception as e:
-            logger.error(f"[{label}] Unexpected error in monitor loop: {e}", exc_info=True)
-            await asyncio.sleep(5)
+            assign_data = normalised_assigned.get(normalise_number(number), {})
+            user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
+            country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
+
+            tasks = [send_otp_to_group(bot, row, otp, country=country)]
+            if user_id:
+                old_balance = get_user_balance(user_id)
+                credit_user(user_id, per_otp)
+                new_balance = get_user_balance(user_id)
+                tasks.append(send_otp_to_user(bot, user_id, row, otp, old_balance, new_balance, country=country))
+            await asyncio.gather(*tasks)
+        if new_otp_count > 0:
+            logger.info(f"[{label}] 📨 {new_otp_count} new OTP(s) processed.")
+        await asyncio.sleep(check_interval)
 
 # ----------------------------------------------------------------------
 # Rate limiting (cooldown 5s)
@@ -1147,7 +1129,7 @@ def check_get_number_rate_limit(user_id):
     return True, 0
 
 # ----------------------------------------------------------------------
-# Telegram handlers
+# Telegram handlers (fully operational)
 # ----------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1833,7 +1815,7 @@ def main():
     application.add_handler(CallbackQueryHandler(change_number_callback, pattern="^change_number:"))
     application.add_handler(CallbackQueryHandler(admin_complete_callback, pattern="^admin_complete_"))
 
-    # ConversationHandlers (without per_message=True)
+    # ConversationHandlers without per_message=True (default = False)
     fake_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Fake Name$"), fake_name_start)],
         states={FAKE_GENDER: [CallbackQueryHandler(fake_gender_select, pattern="^fake_")]},
@@ -1920,7 +1902,7 @@ def main():
 
     application.post_init = post_init
 
-    logger.info("Bot started with robust monitoring. Polling...")
+    logger.info("Bot started (all handlers working, multiple admins supported). Polling...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
