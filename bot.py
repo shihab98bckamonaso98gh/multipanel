@@ -38,7 +38,6 @@ from telegram.ext import (
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Suppress all UserWarnings (including the per_message ones)
 warnings.filterwarnings("ignore", category=UserWarning)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext").setLevel(logging.WARNING)
@@ -57,34 +56,35 @@ if not ADMIN_CHAT_IDS:
     if single_admin:
         ADMIN_CHAT_IDS = {int(single_admin)}
 BOT_USERNAME = os.getenv("BOT_USERNAME")
+ORBITX_SMS_FOOTER = os.getenv("ORBITX_SMS_FOOTER", "ORBIT X SMS")
 
-# Site 1
+# --- Site 1 ---
 SITE1_BASE_URL = os.getenv("SITE1_BASE_URL", "http://54.38.92.155/ints")
 SITE1_USERNAME = os.getenv("SITE1_USERNAME", "thanhxuan")
 SITE1_PASSWORD = os.getenv("SITE1_PASSWORD", "thanhxuan")
 SITE1_CHECK_INTERVAL = int(os.getenv("SITE1_CHECK_INTERVAL", "5"))
 
-# Site 2
+# --- Site 2 (API) ---
 SITE2_API_URL = os.getenv("SITE2_API_URL", "http://147.135.212.197/crapi/had/viewstats")
 SITE2_API_TOKEN = os.getenv("SITE2_API_TOKEN", "")
 SITE2_CHECK_INTERVAL = int(os.getenv("SITE2_CHECK_INTERVAL", "18"))
 
-# Site 3 (SSL issues -> verify=False and custom ciphers)
-SITE3_BASE_URL = os.getenv("SITE3_BASE_URL", "https://nexor-iprn.com")
-SITE3_USERNAME = os.getenv("SITE3_USERNAME", "")
-SITE3_PASSWORD = os.getenv("SITE3_PASSWORD", "")
-SITE3_CHECK_INTERVAL = int(os.getenv("SITE3_CHECK_INTERVAL", "10"))
-
-# Site 4
+# --- Site 4 ---
 SITE4_BASE_URL = os.getenv("SITE4_BASE_URL", "http://168.119.13.175/ints")
 SITE4_USERNAME = os.getenv("SITE4_USERNAME", "")
 SITE4_PASSWORD = os.getenv("SITE4_PASSWORD", "")
 SITE4_CHECK_INTERVAL = int(os.getenv("SITE4_CHECK_INTERVAL", "10"))
 
+# --- Site 5 (Sniper SMS) ---
+SITE5_BASE_URL = os.getenv("SITE5_BASE_URL", "http://135.125.222.224/ints")
+SITE5_USERNAME = os.getenv("SITE5_USERNAME", "")
+SITE5_PASSWORD = os.getenv("SITE5_PASSWORD", "")
+SITE5_CHECK_INTERVAL = int(os.getenv("SITE5_CHECK_INTERVAL", "10"))
+
 # Shared settings
 INTERNAL_RETRIES = 3
 RETRY_BACKOFF = 15
-MAX_BACKOFF = 60
+MAX_BACKOFF = 120
 REQUEST_TIMEOUT = 60
 
 # JSON data files
@@ -104,12 +104,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("sms_otp_bot")
 
-# --- SSL workaround for Site3 ---
-try:
-    requests.packages.urllib3.util.ssl_.DEFAULT_CIPHERS = 'ALL:@SECLEVEL=1'
-except Exception:
-    pass
-
 # Sessions
 session1 = requests.Session()
 session1.headers.update({
@@ -122,24 +116,24 @@ session1.headers.update({
     "Cache-Control": "no-cache",
 })
 
-session3 = requests.Session()
-session3.verify = False                                  # Disable SSL verification for Site3
-session3.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": f"{SITE3_BASE_URL}/agent/SMSCDRReports",
-    "X-Requested-With": "XMLHttpRequest",
-    "Connection": "close",
-    "Cache-Control": "no-cache",
-})
-
 session4 = requests.Session()
 session4.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Accept": "application/json, text/javascript, */*; q=0.01",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": f"{SITE4_BASE_URL}/agent/SMSCDRStats",
+    "X-Requested-With": "XMLHttpRequest",
+    "Connection": "close",
+    "Cache-Control": "no-cache",
+})
+
+# --- Site 5 session ---
+session5 = requests.Session()
+session5.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": f"{SITE5_BASE_URL}/agent/SMSCDRReports",
     "X-Requested-With": "XMLHttpRequest",
     "Connection": "close",
     "Cache-Control": "no-cache",
@@ -218,7 +212,11 @@ def init_db():
                     balance_bdt REAL DEFAULT 0.0,
                     bkash TEXT,
                     rocket TEXT,
-                    binance TEXT
+                    binance TEXT,
+                    today_otps INTEGER DEFAULT 0,
+                    today_earned REAL DEFAULT 0.0,
+                    total_earned REAL DEFAULT 0.0,
+                    last_reset_date TEXT DEFAULT ''
                 )''')
     c.execute('''CREATE TABLE IF NOT EXISTS withdraw_requests (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -240,6 +238,23 @@ def init_db():
                 )''')
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_withdrawal_bdt', '20.0')")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('per_otp_bdt', '0.30')")
+    # Migration for older databases without stats columns
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN today_otps INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN today_earned REAL DEFAULT 0.0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN total_earned REAL DEFAULT 0.0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN last_reset_date TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -273,8 +288,16 @@ def get_user_balance(user_id):
 
 def credit_user(user_id, amount_bdt):
     ensure_user_exists(user_id)
+    today_str = datetime.now().strftime("%Y-%m-%d")
     conn = sqlite3.connect(DB_FILE)
-    conn.execute("UPDATE users SET balance_bdt = balance_bdt + ? WHERE user_id=?", (amount_bdt, user_id))
+    row = conn.execute("SELECT last_reset_date FROM users WHERE user_id=?", (user_id,)).fetchone()
+    last_reset = row[0] if row else ""
+    if last_reset != today_str:
+        # Reset daily counters
+        conn.execute("UPDATE users SET today_otps=0, today_earned=0.0, last_reset_date=? WHERE user_id=?", (today_str, user_id))
+    # Increment
+    conn.execute("UPDATE users SET balance_bdt = balance_bdt + ?, today_otps = today_otps + 1, today_earned = today_earned + ?, total_earned = total_earned + ? WHERE user_id=?",
+                 (amount_bdt, amount_bdt, amount_bdt, user_id))
     conn.commit()
     conn.close()
 
@@ -375,6 +398,50 @@ def set_setting(key, value):
 def is_admin(user_id):
     return user_id in ADMIN_CHAT_IDS
 
+# --- Statistics helpers ---
+def get_user_stats(user_id):
+    """Return stats dict for a single user."""
+    assigned = load_assigned()
+    numbers_used = sum(1 for v in assigned.values() if isinstance(v, dict) and v.get("user_id") == user_id)
+    conn = sqlite3.connect(DB_FILE)
+    row = conn.execute("SELECT today_otps, today_earned, total_earned FROM users WHERE user_id=?", (user_id,)).fetchone()
+    if row:
+        today_otps = row[0] or 0
+        today_earned = row[1] or 0.0
+        total_earned = row[2] or 0.0
+    else:
+        today_otps = 0
+        today_earned = 0.0
+        total_earned = 0.0
+    total_withdrawn_row = conn.execute("SELECT COALESCE(SUM(amount_bdt), 0) FROM withdraw_requests WHERE user_id=? AND status='completed'", (user_id,)).fetchone()
+    total_withdrawn = total_withdrawn_row[0] if total_withdrawn_row else 0.0
+    conn.close()
+    return {
+        "numbers_used": numbers_used,
+        "today_otps": today_otps,
+        "today_earned": today_earned,
+        "total_earned": total_earned,
+        "total_withdrawn": total_withdrawn
+    }
+
+def get_admin_stats():
+    """Return aggregate stats for admins."""
+    assigned = load_assigned()
+    total_numbers = len(assigned)
+    conn = sqlite3.connect(DB_FILE)
+    row = conn.execute("SELECT COALESCE(SUM(today_otps),0), COALESCE(SUM(today_earned),0) FROM users").fetchone()
+    today_otps = row[0] or 0
+    today_earned = row[1] or 0.0
+    total_withdrawn_row = conn.execute("SELECT COALESCE(SUM(amount_bdt), 0) FROM withdraw_requests WHERE status='completed'").fetchone()
+    total_withdrawn = total_withdrawn_row[0] if total_withdrawn_row else 0.0
+    conn.close()
+    return {
+        "numbers_used": total_numbers,
+        "today_otps": today_otps,
+        "today_earned": today_earned,
+        "total_withdrawn": total_withdrawn
+    }
+
 # ----------------------------------------------------------------------
 # Keyboard helper
 # ----------------------------------------------------------------------
@@ -434,10 +501,9 @@ def site_login(session, base_url, username, password, retries=3) -> bool:
     return False
 
 # ----------------------------------------------------------------------
-# Site 1 data fetcher
+# Generic Site Data Fetcher (used by Site1, Site4, Site5)
 # ----------------------------------------------------------------------
-def fetch_data_sync_site1(session) -> Optional[list]:
-    base_url = SITE1_BASE_URL
+def fetch_data_sync_generic(session, base_url) -> Optional[list]:
     today = datetime.now()
     fdate1 = (today - timedelta(days=30)).strftime("%Y-%m-%d 00:00:00")
     fdate2 = (today + timedelta(days=1)).strftime("%Y-%m-%d 23:59:59")
@@ -454,20 +520,20 @@ def fetch_data_sync_site1(session) -> Optional[list]:
         try:
             resp = session.get(data_url, params=params, timeout=REQUEST_TIMEOUT)
         except Exception as e:
-            logger.warning(f"Data request attempt {attempt+1} for Site1 failed: {e}")
+            logger.warning(f"Data request attempt {attempt+1} for {base_url} failed: {e}")
             time.sleep(2)
             continue
         if "login" in resp.url.lower():
-            logger.warning("Session expired for Site1 – re‑login needed.")
+            logger.warning(f"Session expired for {base_url} – re‑login needed.")
             return None
         if resp.status_code != 200:
-            logger.warning(f"HTTP {resp.status_code} for Site1")
+            logger.warning(f"HTTP {resp.status_code} for {base_url}")
             time.sleep(2)
             continue
         try:
             json_data = resp.json()
         except Exception:
-            logger.error(f"JSON decode failed for Site1. First 300 chars: {resp.text[:300]}")
+            logger.error(f"JSON decode failed for {base_url}. First 300 chars: {resp.text[:300]}")
             if "login" in resp.text.lower() and "password" in resp.text.lower():
                 logger.warning("Response is login page.")
                 return None
@@ -475,17 +541,17 @@ def fetch_data_sync_site1(session) -> Optional[list]:
             continue
         rows = json_data.get("aaData")
         if rows is None:
-            logger.info("No 'aaData' in response from Site1.")
+            logger.info(f"No 'aaData' in response from {base_url}.")
             return []
         return rows
-    logger.error("Data fetch failed after all retries for Site1.")
+    logger.error(f"Data fetch failed after all retries for {base_url}.")
     return None
 
-async def fetch_data_async_site1(session) -> Optional[list]:
-    return await asyncio.to_thread(fetch_data_sync_site1, session)
+async def fetch_data_async_generic(session, base_url) -> Optional[list]:
+    return await asyncio.to_thread(fetch_data_sync_generic, session, base_url)
 
 # ----------------------------------------------------------------------
-# Site 2 API fetcher
+# Site 2 API fetcher (unchanged)
 # ----------------------------------------------------------------------
 def fetch_data_sync_site2_api() -> Optional[list]:
     token = SITE2_API_TOKEN
@@ -575,58 +641,7 @@ async def fetch_data_async_site2_api() -> Optional[list]:
     return await asyncio.to_thread(fetch_data_sync_site2_api)
 
 # ----------------------------------------------------------------------
-# Site 3 data fetcher (unchanged, uses session3 with verify=False)
-# ----------------------------------------------------------------------
-def fetch_data_sync_site3(session) -> Optional[list]:
-    base_url = SITE3_BASE_URL
-    today = datetime.now()
-    fdate1 = (today - timedelta(days=30)).strftime("%Y-%m-%d 00:00:00")
-    fdate2 = (today + timedelta(days=1)).strftime("%Y-%m-%d 23:59:59")
-    data_url = f"{base_url}/agent/res/data_smscdr.php"
-    params = {
-        "fdate1": fdate1, "fdate2": fdate2, "frange": "", "fclient": "",
-        "fnum": "", "fcli": "", "fgdate": "", "fgmonth": "", "fgrange": "",
-        "fgclient": "", "fgnumber": "", "fgcli": "", "fg": "0",
-        "sEcho": "1", "iDisplayStart": "0", "iDisplayLength": "-1",
-        "iColumns": "9", "sColumns": "",
-        **{f"mDataProp_{i}": str(i) for i in range(9)},
-    }
-    for attempt in range(INTERNAL_RETRIES):
-        try:
-            resp = session.get(data_url, params=params, timeout=REQUEST_TIMEOUT)
-        except Exception as e:
-            logger.warning(f"Data request attempt {attempt+1} for Site3 failed: {e}")
-            time.sleep(2)
-            continue
-        if "login" in resp.url.lower():
-            logger.warning("Session expired for Site3 – re‑login needed.")
-            return None
-        if resp.status_code != 200:
-            logger.warning(f"HTTP {resp.status_code} for Site3")
-            time.sleep(2)
-            continue
-        try:
-            json_data = resp.json()
-        except Exception:
-            logger.error(f"JSON decode failed for Site3. First 300 chars: {resp.text[:300]}")
-            if "login" in resp.text.lower() and "password" in resp.text.lower():
-                logger.warning("Response is login page.")
-                return None
-            time.sleep(2)
-            continue
-        rows = json_data.get("aaData")
-        if rows is None:
-            logger.info("No 'aaData' in response from Site3.")
-            return []
-        return rows
-    logger.error("Data fetch failed after all retries for Site3.")
-    return None
-
-async def fetch_data_async_site3(session) -> Optional[list]:
-    return await asyncio.to_thread(fetch_data_sync_site3, session)
-
-# ----------------------------------------------------------------------
-# Site 4 helpers
+# Site 4 helpers (unchanged)
 # ----------------------------------------------------------------------
 def get_site4_data_url(session, base_url) -> Optional[str]:
     stats_url = f"{base_url}/agent/SMSCDRStats"
@@ -687,6 +702,70 @@ def fetch_data_sync_site4_from_url(session, data_url) -> Optional[list]:
 
 async def fetch_data_async_site4(session, data_url) -> Optional[list]:
     return await asyncio.to_thread(fetch_data_sync_site4_from_url, session, data_url)
+
+# ----------------------------------------------------------------------
+# Site 5 helpers (unchanged)
+# ----------------------------------------------------------------------
+def get_site5_data_url(session, base_url) -> Optional[str]:
+    """Extract the dynamic data URL from SMSCDRReports page (contains sesskey)."""
+    reports_url = f"{base_url}/agent/SMSCDRReports"
+    for attempt in range(INTERNAL_RETRIES):
+        try:
+            resp = session.get(reports_url, timeout=REQUEST_TIMEOUT)
+            if resp.status_code != 200:
+                logger.warning(f"Site5 reports page HTTP {resp.status_code} (attempt {attempt+1})")
+                time.sleep(2)
+                continue
+            match = re.search(r'"sAjaxSource":\s*"([^"]+)"', resp.text)
+            if match:
+                url = match.group(1)
+                if url.startswith("res/"):
+                    full_url = f"{base_url}/agent/{url}"
+                else:
+                    full_url = f"{base_url}/agent/{url}"
+                logger.info(f"Extracted data URL for Site5: {full_url}")
+                return full_url
+            else:
+                logger.error("sAjaxSource not found in Site5 reports page.")
+                return None
+        except Exception as e:
+            logger.error(f"Error getting Site5 data URL: {e}")
+            time.sleep(2)
+    return None
+
+def fetch_data_sync_site5(session, data_url) -> Optional[list]:
+    """Fetch data using the dynamic URL for Site5."""
+    for attempt in range(INTERNAL_RETRIES):
+        try:
+            session.headers["Referer"] = f"{SITE5_BASE_URL}/agent/SMSCDRReports"
+            resp = session.get(data_url, timeout=REQUEST_TIMEOUT)
+        except Exception as e:
+            logger.warning(f"Site5 data request attempt {attempt+1} failed: {e}")
+            time.sleep(2)
+            continue
+        if "login" in resp.url.lower():
+            logger.warning("Session expired for Site5 – re‑login needed.")
+            return None
+        if resp.status_code != 200:
+            logger.warning(f"HTTP {resp.status_code} for Site5 (attempt {attempt+1})")
+            time.sleep(2)
+            continue
+        try:
+            json_data = resp.json()
+        except Exception:
+            logger.error(f"JSON decode failed for Site5. Response: {resp.text[:300]}")
+            time.sleep(2)
+            continue
+        rows = json_data.get("aaData")
+        if rows is None:
+            logger.info("No 'aaData' in Site5 response.")
+            return []
+        return rows
+    logger.error("Data fetch failed after all retries for Site5.")
+    return None
+
+async def fetch_data_async_site5(session, data_url) -> Optional[list]:
+    return await asyncio.to_thread(fetch_data_sync_site5, session, data_url)
 
 # ----------------------------------------------------------------------
 # OTP extraction & seen pairs
@@ -773,23 +852,16 @@ async def send_otp_to_user(bot: Bot, user_id: int, row: list, otp: str,
         logger.error(f"Failed to send to user {user_id}: {e}")
 
 # ----------------------------------------------------------------------
-# Monitors (unchanged)
+# Generic Monitor (Site1)
 # ----------------------------------------------------------------------
-async def monitor_site1(application: Application):
-    session = session1
-    base_url = SITE1_BASE_URL
-    username = SITE1_USERNAME
-    password = SITE1_PASSWORD
-    seen_file = "seen_pairs_site1.txt"
-    label = "Site1"
-    check_interval = SITE1_CHECK_INTERVAL
+async def generic_monitor(application: Application, session, base_url, username, password,
+                          seen_file, label, check_interval):
     bot = application.bot
-
     if not site_login(session, base_url, username, password):
         logger.critical(f"Initial login failed for {label}.")
 
     seen_pairs = load_seen_pairs(seen_file)
-    rows = await fetch_data_async_site1(session)
+    rows = await fetch_data_async_generic(session, base_url)
     if rows:
         for row in rows:
             if len(row) < 9: continue
@@ -808,12 +880,12 @@ async def monitor_site1(application: Application):
 
     consecutive_failures = 0
     while True:
-        rows = await fetch_data_async_site1(session)
+        rows = await fetch_data_async_generic(session, base_url)
         if rows is None:
             logger.warning(f"[{label}] Data fetch failed. Re‑login required.")
             if site_login(session, base_url, username, password):
                 logger.info(f"[{label}] Re‑login succeeded. Retrying fetch...")
-                rows = await fetch_data_async_site1(session)
+                rows = await fetch_data_async_generic(session, base_url)
                 if rows is not None:
                     consecutive_failures = 0
                 else:
@@ -821,7 +893,7 @@ async def monitor_site1(application: Application):
             else:
                 consecutive_failures += 1
             if rows is None:
-                backoff = min(RETRY_BACKOFF * consecutive_failures, MAX_BACKOFF)
+                backoff = min(RETRY_BACKOFF * (consecutive_failures + 1), MAX_BACKOFF)
                 logger.info(f"[{label}] Waiting {backoff}s before next attempt.")
                 await asyncio.sleep(backoff)
                 continue
@@ -861,6 +933,9 @@ async def monitor_site1(application: Application):
             logger.info(f"[{label}] 📨 {new_otp_count} new OTP(s) processed.")
         await asyncio.sleep(check_interval)
 
+# ----------------------------------------------------------------------
+# Site 2 Monitor
+# ----------------------------------------------------------------------
 async def monitor_site2(application: Application):
     seen_file = "seen_pairs_site2.txt"
     label = "Site2"
@@ -932,92 +1007,9 @@ async def monitor_site2(application: Application):
             logger.info(f"[{label}] 📨 {new_otp_count} new OTP(s) processed.")
         await asyncio.sleep(check_interval)
 
-async def monitor_site3(application: Application):
-    session = session3  # verify=False already set
-    base_url = SITE3_BASE_URL
-    username = SITE3_USERNAME
-    password = SITE3_PASSWORD
-    seen_file = "seen_pairs_site3.txt"
-    label = "Site3"
-    check_interval = SITE3_CHECK_INTERVAL
-    bot = application.bot
-
-    if not site_login(session, base_url, username, password):
-        logger.critical(f"Initial login failed for {label}.")
-
-    seen_pairs = load_seen_pairs(seen_file)
-    rows = await fetch_data_async_site3(session)
-    if rows:
-        for row in rows:
-            if len(row) < 9: continue
-            sms_text = str(row[5])
-            if "#" not in sms_text: continue
-            otp = extract_otp(sms_text)
-            if not otp: continue
-            number = str(row[2]).strip()
-            pair = f"{number}|{otp}"
-            if pair not in seen_pairs:
-                seen_pairs.add(pair)
-                save_seen_pair(seen_file, number, otp)
-        logger.info(f"[{label}] Initialized with {len(seen_pairs)} known OTP pairs.")
-    else:
-        logger.warning(f"[{label}] Initial data fetch returned no rows.")
-
-    consecutive_failures = 0
-    while True:
-        rows = await fetch_data_async_site3(session)
-        if rows is None:
-            logger.warning(f"[{label}] Data fetch failed. Re‑login required.")
-            if site_login(session, base_url, username, password):
-                logger.info(f"[{label}] Re‑login succeeded. Retrying fetch...")
-                rows = await fetch_data_async_site3(session)
-                if rows is not None:
-                    consecutive_failures = 0
-                else:
-                    consecutive_failures += 1
-            else:
-                consecutive_failures += 1
-            if rows is None:
-                backoff = min(RETRY_BACKOFF * consecutive_failures, MAX_BACKOFF)
-                logger.info(f"[{label}] Waiting {backoff}s before next attempt.")
-                await asyncio.sleep(backoff)
-                continue
-        else:
-            consecutive_failures = 0
-
-        assigned = load_assigned()
-        normalised_assigned = {normalise_number(k): v for k, v in assigned.items()}
-        per_otp = float(get_setting("per_otp_bdt", "0.30"))
-        new_otp_count = 0
-        for row in rows:
-            if len(row) < 9: continue
-            sms_text = str(row[5])
-            if "#" not in sms_text: continue
-            otp = extract_otp(sms_text)
-            if not otp: continue
-            number = str(row[2]).strip()
-            pair = f"{number}|{otp}"
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
-            save_seen_pair(seen_file, number, otp)
-            new_otp_count += 1
-
-            assign_data = normalised_assigned.get(normalise_number(number), {})
-            user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
-            country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
-
-            tasks = [send_otp_to_group(bot, row, otp, country=country)]
-            if user_id:
-                old_balance = get_user_balance(user_id)
-                credit_user(user_id, per_otp)
-                new_balance = get_user_balance(user_id)
-                tasks.append(send_otp_to_user(bot, user_id, row, otp, old_balance, new_balance, country=country))
-            await asyncio.gather(*tasks)
-        if new_otp_count > 0:
-            logger.info(f"[{label}] 📨 {new_otp_count} new OTP(s) processed.")
-        await asyncio.sleep(check_interval)
-
+# ----------------------------------------------------------------------
+# Site 4 Monitor
+# ----------------------------------------------------------------------
 async def monitor_site4(application: Application):
     session = session4
     base_url = SITE4_BASE_URL
@@ -1050,8 +1042,6 @@ async def monitor_site4(application: Application):
                     seen_pairs.add(pair)
                     save_seen_pair(seen_file, number, otp)
             logger.info(f"[{label}] Initialized with {len(seen_pairs)} known OTP pairs.")
-    else:
-        logger.warning(f"[{label}] Could not get initial data URL. Will retry.")
 
     consecutive_failures = 0
     while True:
@@ -1067,7 +1057,7 @@ async def monitor_site4(application: Application):
             else:
                 consecutive_failures += 1
             if not data_url:
-                backoff = min(RETRY_BACKOFF * consecutive_failures, MAX_BACKOFF)
+                backoff = min(RETRY_BACKOFF * (consecutive_failures + 1), MAX_BACKOFF)
                 logger.info(f"[{label}] Still no data URL. Waiting {backoff}s.")
                 await asyncio.sleep(backoff)
                 continue
@@ -1118,7 +1108,114 @@ async def monitor_site4(application: Application):
         await asyncio.sleep(check_interval)
 
 # ----------------------------------------------------------------------
-# Rate limiting (cooldown 5s)
+# Site 5 Monitor (improved resilience)
+# ----------------------------------------------------------------------
+async def monitor_site5(application: Application):
+    session = session5
+    base_url = SITE5_BASE_URL
+    username = SITE5_USERNAME
+    password = SITE5_PASSWORD
+    seen_file = "seen_pairs_site5.txt"
+    label = "Site5"
+    check_interval = SITE5_CHECK_INTERVAL
+    bot = application.bot
+    data_url = None
+
+    # Initial login
+    if not site_login(session, base_url, username, password):
+        logger.critical(f"Initial login failed for {label}.")
+    else:
+        data_url = get_site5_data_url(session, base_url)
+
+    seen_pairs = load_seen_pairs(seen_file)
+    if data_url:
+        rows = await fetch_data_async_site5(session, data_url)
+        if rows:
+            for row in rows:
+                if len(row) < 9: continue
+                sms_text = str(row[5])
+                if "#" not in sms_text: continue
+                otp = extract_otp(sms_text)
+                if not otp: continue
+                number = str(row[2]).strip()
+                pair = f"{number}|{otp}"
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    save_seen_pair(seen_file, number, otp)
+            logger.info(f"[{label}] Initialized with {len(seen_pairs)} known OTP pairs.")
+    else:
+        logger.warning(f"[{label}] Could not get initial data URL. Will retry.")
+
+    consecutive_failures = 0
+    while True:
+        if not data_url:
+            logger.info(f"[{label}] Data URL missing, attempting re‑login.")
+            # Force fresh session on login failure
+            session.cookies.clear()
+            if site_login(session, base_url, username, password):
+                data_url = get_site5_data_url(session, base_url)
+                if data_url:
+                    consecutive_failures = 0
+                    logger.info(f"[{label}] Re‑login and URL extraction successful.")
+                else:
+                    consecutive_failures += 1
+            else:
+                consecutive_failures += 1
+            if not data_url:
+                backoff = min(RETRY_BACKOFF * (consecutive_failures + 1), MAX_BACKOFF)
+                logger.info(f"[{label}] Still no data URL. Waiting {backoff}s.")
+                await asyncio.sleep(backoff)
+                continue
+
+        rows = await fetch_data_async_site5(session, data_url)
+        if rows is None:
+            # If session expired (redirect to login) we need to re-login
+            logger.warning(f"[{label}] Data fetch failed. Re‑login required.")
+            data_url = None
+            session.cookies.clear()
+            consecutive_failures += 1
+            backoff = min(RETRY_BACKOFF * consecutive_failures, MAX_BACKOFF)
+            logger.info(f"[{label}] Waiting {backoff}s before next attempt.")
+            await asyncio.sleep(backoff)
+            continue
+        else:
+            consecutive_failures = 0
+
+        assigned = load_assigned()
+        normalised_assigned = {normalise_number(k): v for k, v in assigned.items()}
+        per_otp = float(get_setting("per_otp_bdt", "0.30"))
+        new_otp_count = 0
+        for row in rows:
+            if len(row) < 9: continue
+            sms_text = str(row[5])
+            if "#" not in sms_text: continue
+            otp = extract_otp(sms_text)
+            if not otp: continue
+            number = str(row[2]).strip()
+            pair = f"{number}|{otp}"
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            save_seen_pair(seen_file, number, otp)
+            new_otp_count += 1
+
+            assign_data = normalised_assigned.get(normalise_number(number), {})
+            user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
+            country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
+
+            tasks = [send_otp_to_group(bot, row, otp, country=country)]
+            if user_id:
+                old_balance = get_user_balance(user_id)
+                credit_user(user_id, per_otp)
+                new_balance = get_user_balance(user_id)
+                tasks.append(send_otp_to_user(bot, user_id, row, otp, old_balance, new_balance, country=country))
+            await asyncio.gather(*tasks)
+        if new_otp_count > 0:
+            logger.info(f"[{label}] 📨 {new_otp_count} new OTP(s) processed.")
+        await asyncio.sleep(check_interval)
+
+# ----------------------------------------------------------------------
+# Rate limiting
 # ----------------------------------------------------------------------
 def check_get_number_rate_limit(user_id):
     now = time.time()
@@ -1129,7 +1226,7 @@ def check_get_number_rate_limit(user_id):
     return True, 0
 
 # ----------------------------------------------------------------------
-# Telegram handlers (fully operational)
+# Telegram handlers
 # ----------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1502,16 +1599,15 @@ async def upload_file_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
     sub_name = context.user_data.get("upload_sub")
     pool_key = f"{main_name}_{sub_name}" if sub_name else main_name
     pools = load_pools()
-    if pool_key not in pools:
-        pools[pool_key] = []
-    pools[pool_key].extend(numbers)
+    # REPLACE existing numbers instead of extending
+    pools[pool_key] = numbers
     save_pools(pools)
     try:
         desc = f"{main_name} / {sub_name}" if sub_name else main_name
-        await update.message.bot.send_message(GROUP_CHAT_ID, f"{desc}‑এ {len(numbers)} টি নাম্বার যোগ করা হয়েছে।")
+        await update.message.bot.send_message(GROUP_CHAT_ID, f"{desc}‑এ {len(numbers)} টি নাম্বার আপলোড হয়েছে (আগের নাম্বার মুছে ফেলা হয়েছে)।")
     except Exception as e:
         logger.error(f"Broadcast upload notification failed: {e}")
-    await update.message.reply_text(f"Added {len(numbers)} numbers to {desc}.", reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True))
+    await update.message.reply_text(f"Replaced numbers in {desc} with {len(numbers)} new numbers.", reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True))
     return ConversationHandler.END
 
 # ── Admin: Broadcast ──
@@ -1561,13 +1657,14 @@ def admin_profile_kb():
         ["💰 Balance", "📋 Pending"],
         ["✅ Approved", "✏️ Edit"],
         ["📢 Broadcast", "Upload"],
+        ["Status", "Users status"],
         ["Add/Remove Main Button"],
         ["⬅️ Back"]
     ]
 
 async def back_to_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    kb = admin_profile_kb() if is_admin(user_id) else [["💰 Balance", "📋 Withdraw History"], ["⬅️ Back"]]
+    kb = admin_profile_kb() if is_admin(user_id) else [["💰 Balance", "📋 Withdraw History"], ["Status"], ["⬅️ Back"]]
     await update.message.reply_text("👤 Profile Menu", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
     return ConversationHandler.END
 
@@ -1582,7 +1679,7 @@ async def profile_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(user_id):
         await update.message.reply_text("👤 Profile Menu", reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True))
     else:
-        kb = [["💰 Balance", "📋 Withdraw History"], ["⬅️ Back"]]
+        kb = [["💰 Balance", "📋 Withdraw History"], ["Status"], ["⬅️ Back"]]
         await update.message.reply_text("👤 Profile Menu", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
     return PROFILE_SELECT
 
@@ -1650,6 +1747,42 @@ async def profile_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await add_remove_main(update, context)
     elif text == "📢 Broadcast" and is_admin(user_id):
         return await broadcast_start(update, context)
+    elif text == "Status":
+        stats = get_user_stats(user_id)
+        ex_rate = 125.0
+        today_earned_usd = stats['today_earned'] / ex_rate
+        total_earned_usd = stats['total_earned'] / ex_rate
+        total_withdrawn_usd = stats['total_withdrawn'] / ex_rate
+        msg = (
+            f"📊 <b>YOUR STATISTICS</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📞 Numbers Used: {stats['numbers_used']}\n"
+            f"📩 Today's OTPs: {stats['today_otps']}\n"
+            f"💰 Today's Earned: {stats['today_earned']:.2f} BDT / ${today_earned_usd:.4f} USDT\n"
+            f"💵 Total Earned: {stats['total_earned']:.2f} BDT / ${total_earned_usd:.4f} USDT\n"
+            f"💳 Total Withdrawn: {stats['total_withdrawn']:.2f} BDT / ${total_withdrawn_usd:.4f} USDT\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📢 <b>{ORBITX_SMS_FOOTER}</b>"
+        )
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+        return PROFILE_SELECT
+    elif text == "Users status" and is_admin(user_id):
+        stats = get_admin_stats()
+        ex_rate = 125.0
+        today_earned_usd = stats['today_earned'] / ex_rate
+        total_withdrawn_usd = stats['total_withdrawn'] / ex_rate
+        msg = (
+            f"📊 <b>USERS STATISTICS</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📞 Numbers Used: {stats['numbers_used']}\n"
+            f"📩 Today's OTPs: {stats['today_otps']}\n"
+            f"💰 Today's Cost: {stats['today_earned']:.2f} BDT / ${today_earned_usd:.4f} USDT\n"
+            f"💳 Total Withdrawn: {stats['total_withdrawn']:.2f} BDT / ${total_withdrawn_usd:.4f} USDT\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📢 <b>{ORBITX_SMS_FOOTER}</b>"
+        )
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+        return PROFILE_SELECT
     else:
         return PROFILE_SELECT
 
@@ -1695,7 +1828,7 @@ async def wallet_value_received(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Invalid Binance UID. Must be numeric. Try again or /cancel.", reply_markup=ReplyKeyboardMarkup([["⬅️ Back"]], resize_keyboard=True))
         return SET_WALLET_VALUE
     set_wallet_detail(user_id, method, value)
-    await update.message.reply_text(f"{method.capitalize()} wallet set to: {value}", reply_markup=ReplyKeyboardMarkup(admin_profile_kb() if is_admin(user_id) else [["💰 Balance", "📋 Withdraw History"], ["⬅️ Back"]], resize_keyboard=True))
+    await update.message.reply_text(f"{method.capitalize()} wallet set to: {value}", reply_markup=ReplyKeyboardMarkup(admin_profile_kb() if is_admin(user_id) else [["💰 Balance", "📋 Withdraw History"], ["Status"], ["⬅️ Back"]], resize_keyboard=True))
     return ConversationHandler.END
 
 async def withdraw_method_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1738,9 +1871,9 @@ async def withdraw_amount_received(update: Update, context: ContextTypes.DEFAULT
         return WITHDRAW_AMOUNT
     success, err = create_withdrawal(user_id, amount, context.user_data["withdraw_method"], context.user_data["withdraw_wallet_detail"])
     if success:
-        await update.message.reply_text("✅ Withdrawal request submitted. Processing...", reply_markup=ReplyKeyboardMarkup(admin_profile_kb() if is_admin(user_id) else [["💰 Balance", "📋 Withdraw History"], ["⬅️ Back"]], resize_keyboard=True))
+        await update.message.reply_text("✅ Withdrawal request submitted. Processing...", reply_markup=ReplyKeyboardMarkup(admin_profile_kb() if is_admin(user_id) else [["💰 Balance", "📋 Withdraw History"], ["Status"], ["⬅️ Back"]], resize_keyboard=True))
     else:
-        await update.message.reply_text(f"❌ {err}", reply_markup=ReplyKeyboardMarkup(admin_profile_kb() if is_admin(user_id) else [["💰 Balance", "📋 Withdraw History"], ["⬅️ Back"]], resize_keyboard=True))
+        await update.message.reply_text(f"❌ {err}", reply_markup=ReplyKeyboardMarkup(admin_profile_kb() if is_admin(user_id) else [["💰 Balance", "📋 Withdraw History"], ["Status"], ["⬅️ Back"]], resize_keyboard=True))
     return ConversationHandler.END
 
 async def edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1815,7 +1948,6 @@ def main():
     application.add_handler(CallbackQueryHandler(change_number_callback, pattern="^change_number:"))
     application.add_handler(CallbackQueryHandler(admin_complete_callback, pattern="^admin_complete_"))
 
-    # ConversationHandlers without per_message=True (default = False)
     fake_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Fake Name$"), fake_name_start)],
         states={FAKE_GENDER: [CallbackQueryHandler(fake_gender_select, pattern="^fake_")]},
@@ -1858,7 +1990,7 @@ def main():
         entry_points=[MessageHandler(filters.Regex("^👤 My Profile$"), profile_start)],
         states={
             PROFILE_SELECT: [
-                MessageHandler(filters.Regex("^(💰 Balance|📋 Pending|✅ Approved|📋 Withdraw History|✏️ Edit|Upload|📢 Broadcast|Add/Remove Main Button|⬅️ Back)$"), profile_select),
+                MessageHandler(filters.Regex("^(💰 Balance|📋 Pending|✅ Approved|📋 Withdraw History|✏️ Edit|Upload|📢 Broadcast|Add/Remove Main Button|⬅️ Back|Status|Users status)$"), profile_select),
                 CallbackQueryHandler(profile_callback_handler, pattern="^(profile_set_wallet|profile_withdraw)$"),
             ],
             SET_WALLET_METHOD: [CallbackQueryHandler(wallet_method_select, pattern="^wallet_(bkash|rocket|binance)$")],
@@ -1895,14 +2027,14 @@ def main():
     application.add_handler(profile_conv)
 
     async def post_init(app: Application):
-        asyncio.create_task(monitor_site1(app))
+        asyncio.create_task(generic_monitor(app, session1, SITE1_BASE_URL, SITE1_USERNAME, SITE1_PASSWORD, "seen_pairs_site1.txt", "Site1", SITE1_CHECK_INTERVAL))
         asyncio.create_task(monitor_site2(app))
-        asyncio.create_task(monitor_site3(app))
         asyncio.create_task(monitor_site4(app))
+        asyncio.create_task(monitor_site5(app))
 
     application.post_init = post_init
 
-    logger.info("Bot started (all handlers working, multiple admins supported). Polling...")
+    logger.info("Bot started (Site1, Site2, Site4, Site5). Polling...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
