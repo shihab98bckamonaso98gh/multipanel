@@ -47,10 +47,8 @@ load_dotenv()
 # ---------- Configuration ----------
 TOKEN = os.getenv("BOT_TOKEN")
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
-# Multiple admins: comma-separated list of user IDs
 admin_ids_str = os.getenv("ADMIN_CHAT_IDS", "")
 ADMIN_CHAT_IDS = {int(x.strip()) for x in admin_ids_str.split(",") if x.strip().isdigit()}
-# Fallback to old single ADMIN_CHAT_ID if ADMIN_CHAT_IDS not set
 if not ADMIN_CHAT_IDS:
     single_admin = os.getenv("ADMIN_CHAT_ID")
     if single_admin:
@@ -75,11 +73,11 @@ SITE4_USERNAME = os.getenv("SITE4_USERNAME", "")
 SITE4_PASSWORD = os.getenv("SITE4_PASSWORD", "")
 SITE4_CHECK_INTERVAL = int(os.getenv("SITE4_CHECK_INTERVAL", "10"))
 
-# --- Site 5 (Sniper SMS) ---
-SITE5_BASE_URL = os.getenv("SITE5_BASE_URL", "http://135.125.222.224/ints")
-SITE5_USERNAME = os.getenv("SITE5_USERNAME", "")
-SITE5_PASSWORD = os.getenv("SITE5_PASSWORD", "")
-SITE5_CHECK_INTERVAL = int(os.getenv("SITE5_CHECK_INTERVAL", "10"))
+# --- Site 6 (Flyn SMS) ---
+SITE6_BASE_URL = os.getenv("SITE6_BASE_URL", "http://91.232.105.47/ints")
+SITE6_USERNAME = os.getenv("SITE6_USERNAME", "")
+SITE6_PASSWORD = os.getenv("SITE6_PASSWORD", "")
+SITE6_CHECK_INTERVAL = int(os.getenv("SITE6_CHECK_INTERVAL", "10"))
 
 # Shared settings
 INTERNAL_RETRIES = 3
@@ -127,13 +125,13 @@ session4.headers.update({
     "Cache-Control": "no-cache",
 })
 
-# --- Site 5 session ---
-session5 = requests.Session()
-session5.headers.update({
+# --- Site 6 session ---
+session6 = requests.Session()
+session6.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Accept": "application/json, text/javascript, */*; q=0.01",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": f"{SITE5_BASE_URL}/agent/SMSCDRReports",
+    "Referer": f"{SITE6_BASE_URL}/agent/SMSCDRStats",
     "X-Requested-With": "XMLHttpRequest",
     "Connection": "close",
     "Cache-Control": "no-cache",
@@ -501,7 +499,7 @@ def site_login(session, base_url, username, password, retries=3) -> bool:
     return False
 
 # ----------------------------------------------------------------------
-# Generic Site Data Fetcher (used by Site1, Site4, Site5)
+# Generic Site Data Fetcher (used by Site1, Site6)
 # ----------------------------------------------------------------------
 def fetch_data_sync_generic(session, base_url) -> Optional[list]:
     today = datetime.now()
@@ -704,70 +702,6 @@ async def fetch_data_async_site4(session, data_url) -> Optional[list]:
     return await asyncio.to_thread(fetch_data_sync_site4_from_url, session, data_url)
 
 # ----------------------------------------------------------------------
-# Site 5 helpers (unchanged)
-# ----------------------------------------------------------------------
-def get_site5_data_url(session, base_url) -> Optional[str]:
-    """Extract the dynamic data URL from SMSCDRReports page (contains sesskey)."""
-    reports_url = f"{base_url}/agent/SMSCDRReports"
-    for attempt in range(INTERNAL_RETRIES):
-        try:
-            resp = session.get(reports_url, timeout=REQUEST_TIMEOUT)
-            if resp.status_code != 200:
-                logger.warning(f"Site5 reports page HTTP {resp.status_code} (attempt {attempt+1})")
-                time.sleep(2)
-                continue
-            match = re.search(r'"sAjaxSource":\s*"([^"]+)"', resp.text)
-            if match:
-                url = match.group(1)
-                if url.startswith("res/"):
-                    full_url = f"{base_url}/agent/{url}"
-                else:
-                    full_url = f"{base_url}/agent/{url}"
-                logger.info(f"Extracted data URL for Site5: {full_url}")
-                return full_url
-            else:
-                logger.error("sAjaxSource not found in Site5 reports page.")
-                return None
-        except Exception as e:
-            logger.error(f"Error getting Site5 data URL: {e}")
-            time.sleep(2)
-    return None
-
-def fetch_data_sync_site5(session, data_url) -> Optional[list]:
-    """Fetch data using the dynamic URL for Site5."""
-    for attempt in range(INTERNAL_RETRIES):
-        try:
-            session.headers["Referer"] = f"{SITE5_BASE_URL}/agent/SMSCDRReports"
-            resp = session.get(data_url, timeout=REQUEST_TIMEOUT)
-        except Exception as e:
-            logger.warning(f"Site5 data request attempt {attempt+1} failed: {e}")
-            time.sleep(2)
-            continue
-        if "login" in resp.url.lower():
-            logger.warning("Session expired for Site5 – re‑login needed.")
-            return None
-        if resp.status_code != 200:
-            logger.warning(f"HTTP {resp.status_code} for Site5 (attempt {attempt+1})")
-            time.sleep(2)
-            continue
-        try:
-            json_data = resp.json()
-        except Exception:
-            logger.error(f"JSON decode failed for Site5. Response: {resp.text[:300]}")
-            time.sleep(2)
-            continue
-        rows = json_data.get("aaData")
-        if rows is None:
-            logger.info("No 'aaData' in Site5 response.")
-            return []
-        return rows
-    logger.error("Data fetch failed after all retries for Site5.")
-    return None
-
-async def fetch_data_async_site5(session, data_url) -> Optional[list]:
-    return await asyncio.to_thread(fetch_data_sync_site5, session, data_url)
-
-# ----------------------------------------------------------------------
 # OTP extraction & seen pairs
 # ----------------------------------------------------------------------
 def extract_otp(sms_text: str) -> Optional[str]:
@@ -852,7 +786,7 @@ async def send_otp_to_user(bot: Bot, user_id: int, row: list, otp: str,
         logger.error(f"Failed to send to user {user_id}: {e}")
 
 # ----------------------------------------------------------------------
-# Generic Monitor (Site1)
+# Generic Monitor (Site1, Site6)
 # ----------------------------------------------------------------------
 async def generic_monitor(application: Application, session, base_url, username, password,
                           seen_file, label, check_interval):
@@ -922,6 +856,7 @@ async def generic_monitor(application: Application, session, base_url, username,
             user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
             country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
 
+            # Always send to group (even if not assigned)
             tasks = [send_otp_to_group(bot, row, otp, country=country)]
             if user_id:
                 old_balance = get_user_balance(user_id)
@@ -996,6 +931,7 @@ async def monitor_site2(application: Application):
             user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
             country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
 
+            # Always send to group
             tasks = [send_otp_to_group(bot, row, otp, country=country)]
             if user_id:
                 old_balance = get_user_balance(user_id)
@@ -1096,113 +1032,7 @@ async def monitor_site4(application: Application):
             user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
             country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
 
-            tasks = [send_otp_to_group(bot, row, otp, country=country)]
-            if user_id:
-                old_balance = get_user_balance(user_id)
-                credit_user(user_id, per_otp)
-                new_balance = get_user_balance(user_id)
-                tasks.append(send_otp_to_user(bot, user_id, row, otp, old_balance, new_balance, country=country))
-            await asyncio.gather(*tasks)
-        if new_otp_count > 0:
-            logger.info(f"[{label}] 📨 {new_otp_count} new OTP(s) processed.")
-        await asyncio.sleep(check_interval)
-
-# ----------------------------------------------------------------------
-# Site 5 Monitor (improved resilience)
-# ----------------------------------------------------------------------
-async def monitor_site5(application: Application):
-    session = session5
-    base_url = SITE5_BASE_URL
-    username = SITE5_USERNAME
-    password = SITE5_PASSWORD
-    seen_file = "seen_pairs_site5.txt"
-    label = "Site5"
-    check_interval = SITE5_CHECK_INTERVAL
-    bot = application.bot
-    data_url = None
-
-    # Initial login
-    if not site_login(session, base_url, username, password):
-        logger.critical(f"Initial login failed for {label}.")
-    else:
-        data_url = get_site5_data_url(session, base_url)
-
-    seen_pairs = load_seen_pairs(seen_file)
-    if data_url:
-        rows = await fetch_data_async_site5(session, data_url)
-        if rows:
-            for row in rows:
-                if len(row) < 9: continue
-                sms_text = str(row[5])
-                if "#" not in sms_text: continue
-                otp = extract_otp(sms_text)
-                if not otp: continue
-                number = str(row[2]).strip()
-                pair = f"{number}|{otp}"
-                if pair not in seen_pairs:
-                    seen_pairs.add(pair)
-                    save_seen_pair(seen_file, number, otp)
-            logger.info(f"[{label}] Initialized with {len(seen_pairs)} known OTP pairs.")
-    else:
-        logger.warning(f"[{label}] Could not get initial data URL. Will retry.")
-
-    consecutive_failures = 0
-    while True:
-        if not data_url:
-            logger.info(f"[{label}] Data URL missing, attempting re‑login.")
-            # Force fresh session on login failure
-            session.cookies.clear()
-            if site_login(session, base_url, username, password):
-                data_url = get_site5_data_url(session, base_url)
-                if data_url:
-                    consecutive_failures = 0
-                    logger.info(f"[{label}] Re‑login and URL extraction successful.")
-                else:
-                    consecutive_failures += 1
-            else:
-                consecutive_failures += 1
-            if not data_url:
-                backoff = min(RETRY_BACKOFF * (consecutive_failures + 1), MAX_BACKOFF)
-                logger.info(f"[{label}] Still no data URL. Waiting {backoff}s.")
-                await asyncio.sleep(backoff)
-                continue
-
-        rows = await fetch_data_async_site5(session, data_url)
-        if rows is None:
-            # If session expired (redirect to login) we need to re-login
-            logger.warning(f"[{label}] Data fetch failed. Re‑login required.")
-            data_url = None
-            session.cookies.clear()
-            consecutive_failures += 1
-            backoff = min(RETRY_BACKOFF * consecutive_failures, MAX_BACKOFF)
-            logger.info(f"[{label}] Waiting {backoff}s before next attempt.")
-            await asyncio.sleep(backoff)
-            continue
-        else:
-            consecutive_failures = 0
-
-        assigned = load_assigned()
-        normalised_assigned = {normalise_number(k): v for k, v in assigned.items()}
-        per_otp = float(get_setting("per_otp_bdt", "0.30"))
-        new_otp_count = 0
-        for row in rows:
-            if len(row) < 9: continue
-            sms_text = str(row[5])
-            if "#" not in sms_text: continue
-            otp = extract_otp(sms_text)
-            if not otp: continue
-            number = str(row[2]).strip()
-            pair = f"{number}|{otp}"
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
-            save_seen_pair(seen_file, number, otp)
-            new_otp_count += 1
-
-            assign_data = normalised_assigned.get(normalise_number(number), {})
-            user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
-            country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
-
+            # Always send to group
             tasks = [send_otp_to_group(bot, row, otp, country=country)]
             if user_id:
                 old_balance = get_user_balance(user_id)
@@ -1948,9 +1778,15 @@ def main():
     application.add_handler(CallbackQueryHandler(change_number_callback, pattern="^change_number:"))
     application.add_handler(CallbackQueryHandler(admin_complete_callback, pattern="^admin_complete_"))
 
+    # Fake Name conversation with fallback to cancel on any text (fixes stuck state)
     fake_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Fake Name$"), fake_name_start)],
-        states={FAKE_GENDER: [CallbackQueryHandler(fake_gender_select, pattern="^fake_")]},
+        states={
+            FAKE_GENDER: [
+                CallbackQueryHandler(fake_gender_select, pattern="^fake_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, cancel)  # cancel on any text
+            ]
+        },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     application.add_handler(fake_conv)
@@ -2030,11 +1866,11 @@ def main():
         asyncio.create_task(generic_monitor(app, session1, SITE1_BASE_URL, SITE1_USERNAME, SITE1_PASSWORD, "seen_pairs_site1.txt", "Site1", SITE1_CHECK_INTERVAL))
         asyncio.create_task(monitor_site2(app))
         asyncio.create_task(monitor_site4(app))
-        asyncio.create_task(monitor_site5(app))
+        asyncio.create_task(generic_monitor(app, session6, SITE6_BASE_URL, SITE6_USERNAME, SITE6_PASSWORD, "seen_pairs_site6.txt", "Site6", SITE6_CHECK_INTERVAL))
 
     application.post_init = post_init
 
-    logger.info("Bot started (Site1, Site2, Site4, Site5). Polling...")
+    logger.info("Bot started (Site1, Site2, Site4, Site6). Polling...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
