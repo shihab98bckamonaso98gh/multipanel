@@ -85,6 +85,10 @@ RETRY_BACKOFF = 15
 MAX_BACKOFF = 120
 REQUEST_TIMEOUT = 60
 
+# How long to wait before retrying login after credential failure (in seconds)
+LOGIN_FAILURE_BASE_BACKOFF = 3600   # 1 hour
+LOGIN_FAILURE_MAX_BACKOFF = 43200   # 12 hours
+
 # JSON data files
 MAIN_BUTTONS_FILE = "main_buttons.json"
 SUB_BUTTONS_FILE = "sub_buttons.json"
@@ -786,34 +790,54 @@ async def send_otp_to_user(bot: Bot, user_id: int, row: list, otp: str,
         logger.error(f"Failed to send to user {user_id}: {e}")
 
 # ----------------------------------------------------------------------
-# Generic Monitor (Site1, Site6)
+# Generic Monitor (Site1, Site6) – with credential‑change resilience
 # ----------------------------------------------------------------------
 async def generic_monitor(application: Application, session, base_url, username, password,
                           seen_file, label, check_interval):
     bot = application.bot
+    login_failures = 0
+
     if not site_login(session, base_url, username, password):
-        logger.critical(f"Initial login failed for {label}.")
+        logger.critical(f"Initial login failed for {label}. Will retry after backoff.")
+        login_failures = 1
 
     seen_pairs = load_seen_pairs(seen_file)
-    rows = await fetch_data_async_generic(session, base_url)
-    if rows:
-        for row in rows:
-            if len(row) < 9: continue
-            sms_text = str(row[5])
-            if "#" not in sms_text: continue
-            otp = extract_otp(sms_text)
-            if not otp: continue
-            number = str(row[2]).strip()
-            pair = f"{number}|{otp}"
-            if pair not in seen_pairs:
-                seen_pairs.add(pair)
-                save_seen_pair(seen_file, number, otp)
-        logger.info(f"[{label}] Initialized with {len(seen_pairs)} known OTP pairs.")
+    if login_failures == 0:
+        rows = await fetch_data_async_generic(session, base_url)
+        if rows:
+            for row in rows:
+                if len(row) < 9: continue
+                sms_text = str(row[5])
+                if "#" not in sms_text: continue
+                otp = extract_otp(sms_text)
+                if not otp: continue
+                number = str(row[2]).strip()
+                pair = f"{number}|{otp}"
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    save_seen_pair(seen_file, number, otp)
+            logger.info(f"[{label}] Initialized with {len(seen_pairs)} known OTP pairs.")
+        else:
+            logger.warning(f"[{label}] Initial data fetch returned no rows.")
     else:
-        logger.warning(f"[{label}] Initial data fetch returned no rows.")
+        logger.warning(f"[{label}] Waiting {LOGIN_FAILURE_BASE_BACKOFF}s before first retry...")
+        await asyncio.sleep(LOGIN_FAILURE_BASE_BACKOFF)
 
     consecutive_failures = 0
     while True:
+        if login_failures > 0:
+            backoff = min(LOGIN_FAILURE_BASE_BACKOFF * login_failures, LOGIN_FAILURE_MAX_BACKOFF)
+            logger.info(f"[{label}] Re‑attempting login after {backoff}s due to previous failures.")
+            if site_login(session, base_url, username, password):
+                login_failures = 0
+                consecutive_failures = 0
+                logger.info(f"[{label}] Login succeeded after {backoff}s wait.")
+            else:
+                login_failures += 1
+                logger.warning(f"[{label}] Login still failing. Next retry in {min(LOGIN_FAILURE_BASE_BACKOFF * login_failures, LOGIN_FAILURE_MAX_BACKOFF)}s.")
+                await asyncio.sleep(backoff)
+                continue
+
         rows = await fetch_data_async_generic(session, base_url)
         if rows is None:
             logger.warning(f"[{label}] Data fetch failed. Re‑login required.")
@@ -825,14 +849,19 @@ async def generic_monitor(application: Application, session, base_url, username,
                 else:
                     consecutive_failures += 1
             else:
+                login_failures = 1   # start credential failure backoff
                 consecutive_failures += 1
             if rows is None:
-                backoff = min(RETRY_BACKOFF * (consecutive_failures + 1), MAX_BACKOFF)
+                if login_failures == 0:
+                    backoff = min(RETRY_BACKOFF * (consecutive_failures + 1), MAX_BACKOFF)
+                else:
+                    backoff = min(LOGIN_FAILURE_BASE_BACKOFF * login_failures, LOGIN_FAILURE_MAX_BACKOFF)
                 logger.info(f"[{label}] Waiting {backoff}s before next attempt.")
                 await asyncio.sleep(backoff)
                 continue
         else:
             consecutive_failures = 0
+            login_failures = 0
 
         assigned = load_assigned()
         normalised_assigned = {normalise_number(k): v for k, v in assigned.items()}
@@ -856,7 +885,6 @@ async def generic_monitor(application: Application, session, base_url, username,
             user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
             country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
 
-            # Always send to group (even if not assigned)
             tasks = [send_otp_to_group(bot, row, otp, country=country)]
             if user_id:
                 old_balance = get_user_balance(user_id)
@@ -869,13 +897,14 @@ async def generic_monitor(application: Application, session, base_url, username,
         await asyncio.sleep(check_interval)
 
 # ----------------------------------------------------------------------
-# Site 2 Monitor
+# Site 2 Monitor (API) – token invalid handling
 # ----------------------------------------------------------------------
 async def monitor_site2(application: Application):
     seen_file = "seen_pairs_site2.txt"
     label = "Site2"
     check_interval = SITE2_CHECK_INTERVAL
     bot = application.bot
+    login_failures = 0   # for API we treat repeated None as token failure
 
     seen_pairs = load_seen_pairs(seen_file)
     rows = await fetch_data_async_site2_api()
@@ -894,18 +923,27 @@ async def monitor_site2(application: Application):
         logger.info(f"[{label}] Initialized with {len(seen_pairs)} known OTP pairs (API).")
     else:
         logger.warning(f"[{label}] Initial API fetch returned no rows. Will keep trying.")
+        login_failures = 1
 
     consecutive_failures = 0
     while True:
+        if login_failures > 0:
+            backoff = min(LOGIN_FAILURE_BASE_BACKOFF * login_failures, LOGIN_FAILURE_MAX_BACKOFF)
+            logger.info(f"[{label}] Waiting {backoff}s before next API attempt due to persistent failure.")
+            await asyncio.sleep(backoff)
+
         rows = await fetch_data_async_site2_api()
         if rows is None:
             consecutive_failures += 1
+            if consecutive_failures >= 3:
+                login_failures = max(login_failures, 1)
             backoff = min(RETRY_BACKOFF * consecutive_failures, MAX_BACKOFF)
             logger.warning(f"[{label}] API fetch failed. Consecutive: {consecutive_failures}. Waiting {backoff}s.")
             await asyncio.sleep(backoff)
             continue
         else:
             consecutive_failures = 0
+            login_failures = 0
 
         assigned = load_assigned()
         normalised_assigned = {normalise_number(k): v for k, v in assigned.items()}
@@ -931,7 +969,6 @@ async def monitor_site2(application: Application):
             user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
             country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
 
-            # Always send to group
             tasks = [send_otp_to_group(bot, row, otp, country=country)]
             if user_id:
                 old_balance = get_user_balance(user_id)
@@ -944,7 +981,7 @@ async def monitor_site2(application: Application):
         await asyncio.sleep(check_interval)
 
 # ----------------------------------------------------------------------
-# Site 4 Monitor
+# Site 4 Monitor – with credential‑change resilience
 # ----------------------------------------------------------------------
 async def monitor_site4(application: Application):
     session = session4
@@ -956,14 +993,16 @@ async def monitor_site4(application: Application):
     check_interval = SITE4_CHECK_INTERVAL
     bot = application.bot
     data_url = None
+    login_failures = 0
 
     if not site_login(session, base_url, username, password):
-        logger.critical(f"Initial login failed for {label}.")
+        logger.critical(f"Initial login failed for {label}. Will retry after backoff.")
+        login_failures = 1
     else:
         data_url = get_site4_data_url(session, base_url)
 
     seen_pairs = load_seen_pairs(seen_file)
-    if data_url:
+    if login_failures == 0 and data_url:
         rows = await fetch_data_async_site4(session, data_url)
         if rows:
             for row in rows:
@@ -978,9 +1017,26 @@ async def monitor_site4(application: Application):
                     seen_pairs.add(pair)
                     save_seen_pair(seen_file, number, otp)
             logger.info(f"[{label}] Initialized with {len(seen_pairs)} known OTP pairs.")
+    elif login_failures > 0:
+        logger.warning(f"[{label}] Waiting {LOGIN_FAILURE_BASE_BACKOFF}s before first retry...")
+        await asyncio.sleep(LOGIN_FAILURE_BASE_BACKOFF)
 
     consecutive_failures = 0
     while True:
+        if login_failures > 0:
+            backoff = min(LOGIN_FAILURE_BASE_BACKOFF * login_failures, LOGIN_FAILURE_MAX_BACKOFF)
+            logger.info(f"[{label}] Re‑attempting login after {backoff}s due to previous failures.")
+            if site_login(session, base_url, username, password):
+                login_failures = 0
+                consecutive_failures = 0
+                data_url = get_site4_data_url(session, base_url)
+                logger.info(f"[{label}] Login succeeded after {backoff}s wait.")
+            else:
+                login_failures += 1
+                logger.warning(f"[{label}] Login still failing. Next retry in {min(LOGIN_FAILURE_BASE_BACKOFF * login_failures, LOGIN_FAILURE_MAX_BACKOFF)}s.")
+                await asyncio.sleep(backoff)
+                continue
+
         if not data_url:
             logger.info(f"[{label}] Data URL missing, attempting re‑login.")
             if site_login(session, base_url, username, password):
@@ -991,9 +1047,13 @@ async def monitor_site4(application: Application):
                 else:
                     consecutive_failures += 1
             else:
+                login_failures = 1
                 consecutive_failures += 1
             if not data_url:
-                backoff = min(RETRY_BACKOFF * (consecutive_failures + 1), MAX_BACKOFF)
+                if login_failures == 0:
+                    backoff = min(RETRY_BACKOFF * (consecutive_failures + 1), MAX_BACKOFF)
+                else:
+                    backoff = min(LOGIN_FAILURE_BASE_BACKOFF * login_failures, LOGIN_FAILURE_MAX_BACKOFF)
                 logger.info(f"[{label}] Still no data URL. Waiting {backoff}s.")
                 await asyncio.sleep(backoff)
                 continue
@@ -1003,12 +1063,15 @@ async def monitor_site4(application: Application):
             logger.warning(f"[{label}] Data fetch failed. Invalidating data URL.")
             data_url = None
             consecutive_failures += 1
+            if consecutive_failures >= 3:
+                login_failures = max(login_failures, 1)
             backoff = min(RETRY_BACKOFF * consecutive_failures, MAX_BACKOFF)
             logger.info(f"[{label}] Waiting {backoff}s before next attempt.")
             await asyncio.sleep(backoff)
             continue
         else:
             consecutive_failures = 0
+            login_failures = 0
 
         assigned = load_assigned()
         normalised_assigned = {normalise_number(k): v for k, v in assigned.items()}
@@ -1032,7 +1095,6 @@ async def monitor_site4(application: Application):
             user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
             country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
 
-            # Always send to group
             tasks = [send_otp_to_group(bot, row, otp, country=country)]
             if user_id:
                 old_balance = get_user_balance(user_id)
