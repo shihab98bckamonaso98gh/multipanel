@@ -143,7 +143,7 @@ session6.headers.update({
 last_get_number: Dict[int, float] = {}
 
 # ----------------------------------------------------------------------
-# JSON & SQLite helpers (unchanged)
+# JSON & SQLite helpers
 # ----------------------------------------------------------------------
 def load_json(filename, default):
     if not os.path.exists(filename):
@@ -204,7 +204,7 @@ def load_users() -> Set[int]:
 def save_users(users: Set[int]):
     save_json(USERS_FILE, list(users))
 
-# ---------- SQLite helpers (unchanged) ----------
+# ---------- SQLite helpers ----------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -438,7 +438,7 @@ def build_menu_buttons(buttons, header_buttons=None, footer_buttons=None):
 # ----------------------------------------------------------------------
 async def is_member_of_channel(bot, user_id: int) -> bool:
     if not REQUIRED_CHANNEL_USERNAME:
-        return True  # no channel enforced
+        return True
     try:
         member = await bot.get_chat_member(f"@{REQUIRED_CHANNEL_USERNAME}", user_id)
         return member.status not in ("left", "kicked")
@@ -466,7 +466,6 @@ async def verify_join_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     if await is_member_of_channel(context.bot, query.from_user.id):
         await query.edit_message_text("✅ <b>Verified!</b> Welcome back.", parse_mode=ParseMode.HTML)
-        # Send main menu
         await start(update, context)
     else:
         await query.answer("❌ You haven't joined yet. Please join and try again.", show_alert=True)
@@ -704,9 +703,11 @@ async def fetch_data_async_site4(session, data_url) -> Optional[list]:
 def extract_otp(sms_text: str) -> Optional[str]:
     if not isinstance(sms_text, str):
         return None
+    # Match "# 123456 is your ..."
     match = re.search(r"#\s*((?:\d+\s*)+?)\s*is\s+your", sms_text)
     if match:
         return re.sub(r"\s+", "", match.group(1))
+    # Match "# 123456" at start of a line
     match2 = re.search(r"#\s*(\d[\d\s]+)", sms_text)
     if match2:
         return re.sub(r"\s+", "", match2.group(1))
@@ -739,6 +740,9 @@ def mask_number(num: str) -> str:
     return num[:4] + "*" * (len(num) - 7) + num[-3:]
 
 async def send_otp_to_group(bot: Bot, row: list, otp: str, country: str = ""):
+    if not GROUP_CHAT_ID:
+        logger.warning("GROUP_CHAT_ID not set. Skipping group notification.")
+        return
     number = str(row[2]).strip()
     cli = str(row[3]).strip() if len(row) > 3 else ""
     sms = str(row[5]).strip() if len(row) > 5 else ""
@@ -869,9 +873,12 @@ async def generic_monitor(application: Application, session, base_url, username,
             seen_pairs.add(pair)
             save_seen_pair(seen_file, number, otp)
             new_otp_count += 1
+            logger.info(f"[{label}] New OTP: {otp} for {number}")
+
             assign_data = normalised_assigned.get(normalise_number(number), {})
             user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
             country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
+
             tasks = [send_otp_to_group(bot, row, otp, country=country)]
             if user_id:
                 old_balance = get_user_balance(user_id)
@@ -1239,7 +1246,7 @@ async def assign_number_and_display(query_or_update, main_name, sub_name, user_i
     else:
         await query_or_update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
-# ── Fake Name flow (simplified) ──
+# ── Fake Name flow (individual copy buttons) ──
 FAKE_GENDER = 1
 
 async def fake_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1279,9 +1286,10 @@ async def fake_gender_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"<b>Username:</b> {username}\n"
         f"<b>Password:</b> <code>{password}</code>"
     )
-    copy_string = f"{full_name}\n{username}\n{password}"
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 Copy All", copy_text=CopyTextButton(text=copy_string))],
+        [InlineKeyboardButton("📋 Copy Name", copy_text=CopyTextButton(text=full_name))],
+        [InlineKeyboardButton("📋 Copy Username", copy_text=CopyTextButton(text=username))],
+        [InlineKeyboardButton("📋 Copy Password", copy_text=CopyTextButton(text=password))],
         [InlineKeyboardButton("🔄 Change Details", callback_data=f"fake_{gender}")]
     ])
     await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
@@ -1326,7 +1334,7 @@ async def get2fa_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Error generating code. Check your secret.")
     return ConversationHandler.END
 
-# ── Admin handlers (unchanged except channel check added where needed) ──
+# ── Admin handlers (unchanged) ──
 ADD_MAIN, REMOVE_MAIN_SELECT = range(2)
 
 async def add_remove_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
