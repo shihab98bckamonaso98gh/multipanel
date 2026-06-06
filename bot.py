@@ -446,7 +446,6 @@ async def is_member_of_channel(bot, user_id: int) -> bool:
         return False
 
 async def enforce_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Send join message if not a member. Returns True if allowed."""
     user = update.effective_user
     if await is_member_of_channel(context.bot, user.id):
         return True
@@ -698,17 +697,34 @@ async def fetch_data_async_site4(session, data_url) -> Optional[list]:
     return await asyncio.to_thread(fetch_data_sync_site4_from_url, session, data_url)
 
 # ----------------------------------------------------------------------
-# OTP extraction & seen pairs
+# ** IMPROVED OTP extraction **
 # ----------------------------------------------------------------------
 def extract_otp(sms_text: str) -> Optional[str]:
     if not isinstance(sms_text, str):
         return None
+
+    # 1) Classic "# 123456 is your ..."
     match = re.search(r"#\s*((?:\d+\s*)+?)\s*is\s+your", sms_text)
     if match:
         return re.sub(r"\s+", "", match.group(1))
-    match2 = re.search(r"#\s*(\d[\d\s]+)", sms_text)
-    if match2:
-        return re.sub(r"\s+", "", match2.group(1))
+
+    # 2) "code/otp/pin: 123456" (with optional dash)
+    match = re.search(r"(?:code|otp|pin|password)\s*[:\s]?\s*(\d[\d\s\-]+)", sms_text, re.IGNORECASE)
+    if match:
+        digits = re.sub(r"[^\d]", "", match.group(1))
+        if 3 <= len(digits) <= 8:
+            return digits
+
+    # 3) Fallback: first 4‑8 digit number in the whole message
+    match = re.search(r"\b(\d{4,8})\b", sms_text)
+    if match:
+        return match.group(1)
+
+    # 4) Last resort: "# 123456" style (broad)
+    match = re.search(r"#\s*(\d[\d\s]+)", sms_text)
+    if match:
+        return re.sub(r"\s+", "", match.group(1))
+
     return None
 
 def load_seen_pairs(filename) -> Set[str]:
@@ -800,7 +816,6 @@ async def generic_monitor(application: Application, session, base_url, username,
             for row in rows:
                 if len(row) < 9: continue
                 sms_text = str(row[5])
-                if "#" not in sms_text: continue
                 otp = extract_otp(sms_text)
                 if not otp: continue
                 number = str(row[2]).strip()
@@ -861,7 +876,6 @@ async def generic_monitor(application: Application, session, base_url, username,
         for row in rows:
             if len(row) < 9: continue
             sms_text = str(row[5])
-            if "#" not in sms_text: continue
             otp = extract_otp(sms_text)
             if not otp: continue
             number = str(row[2]).strip()
@@ -871,7 +885,7 @@ async def generic_monitor(application: Application, session, base_url, username,
             seen_pairs.add(pair)
             save_seen_pair(seen_file, number, otp)
             new_otp_count += 1
-            logger.info(f"[{label}] New OTP: {otp} for {number}")
+            logger.info(f"[{label}] New OTP: {otp} for {number} (SMS: {sms_text[:50]}...)")
 
             assign_data = normalised_assigned.get(normalise_number(number), {})
             user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
@@ -903,7 +917,6 @@ async def monitor_site2(application: Application):
         for row in rows:
             if len(row) < 9: continue
             sms_text = str(row[5])
-            if "#" not in sms_text: continue
             otp = extract_otp(sms_text)
             if not otp: continue
             number = str(row[2]).strip()
@@ -940,7 +953,6 @@ async def monitor_site2(application: Application):
         for row in rows:
             if len(row) < 9: continue
             sms_text = str(row[5])
-            if "#" not in sms_text: continue
             otp = extract_otp(sms_text)
             if not otp: continue
             number = str(row[2]).strip()
@@ -992,7 +1004,6 @@ async def monitor_site4(application: Application):
             for row in rows:
                 if len(row) < 9: continue
                 sms_text = str(row[5])
-                if "#" not in sms_text: continue
                 otp = extract_otp(sms_text)
                 if not otp: continue
                 number = str(row[2]).strip()
@@ -1062,7 +1073,6 @@ async def monitor_site4(application: Application):
         for row in rows:
             if len(row) < 9: continue
             sms_text = str(row[5])
-            if "#" not in sms_text: continue
             otp = extract_otp(sms_text)
             if not otp: continue
             number = str(row[2]).strip()
@@ -1244,7 +1254,7 @@ async def assign_number_and_display(query_or_update, main_name, sub_name, user_i
     else:
         await query_or_update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
-# ── Fake Name flow (individual copy buttons) ──
+# ── Fake Name flow (only Change Details button) ──
 FAKE_GENDER = 1
 
 async def fake_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1285,9 +1295,6 @@ async def fake_gender_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"<b>Password:</b> <code>{password}</code>"
     )
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 Copy Name", copy_text=CopyTextButton(text=full_name))],
-        [InlineKeyboardButton("📋 Copy Username", copy_text=CopyTextButton(text=username))],
-        [InlineKeyboardButton("📋 Copy Password", copy_text=CopyTextButton(text=password))],
         [InlineKeyboardButton("🔄 Change Details", callback_data=f"fake_{gender}")]
     ])
     await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
