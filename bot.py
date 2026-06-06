@@ -22,6 +22,7 @@ from telegram import (
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     Update,
+    ChatMember,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -33,7 +34,6 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.error import BadRequest
 
 # --- Disable SSL warnings for sites with problematic certificates ---
 import urllib3
@@ -48,6 +48,7 @@ load_dotenv()
 # ---------- Configuration ----------
 TOKEN = os.getenv("BOT_TOKEN")
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
+CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK", "https://t.me/otpservers")  # Required join link
 admin_ids_str = os.getenv("ADMIN_CHAT_IDS", "")
 ADMIN_CHAT_IDS = {int(x.strip()) for x in admin_ids_str.split(",") if x.strip().isdigit()}
 if not ADMIN_CHAT_IDS:
@@ -56,7 +57,6 @@ if not ADMIN_CHAT_IDS:
         ADMIN_CHAT_IDS = {int(single_admin)}
 BOT_USERNAME = os.getenv("BOT_USERNAME")
 ORBITX_SMS_FOOTER = os.getenv("ORBITX_SMS_FOOTER", "ORBIT X SMS")
-REQUIRED_CHANNEL_USERNAME = os.getenv("REQUIRED_CHANNEL_USERNAME", "").replace("@", "")
 
 # --- Site 1 ---
 SITE1_BASE_URL = os.getenv("SITE1_BASE_URL", "http://54.38.92.155/ints")
@@ -86,8 +86,10 @@ INTERNAL_RETRIES = 3
 RETRY_BACKOFF = 15
 MAX_BACKOFF = 120
 REQUEST_TIMEOUT = 60
-LOGIN_FAILURE_BASE_BACKOFF = 3600
-LOGIN_FAILURE_MAX_BACKOFF = 43200
+
+# How long to wait before retrying login after credential failure (in seconds)
+LOGIN_FAILURE_BASE_BACKOFF = 3600   # 1 hour
+LOGIN_FAILURE_MAX_BACKOFF = 43200   # 12 hours
 
 # JSON data files
 MAIN_BUTTONS_FILE = "main_buttons.json"
@@ -129,6 +131,7 @@ session4.headers.update({
     "Cache-Control": "no-cache",
 })
 
+# --- Site 6 session ---
 session6 = requests.Session()
 session6.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -143,7 +146,7 @@ session6.headers.update({
 last_get_number: Dict[int, float] = {}
 
 # ----------------------------------------------------------------------
-# JSON & SQLite helpers (unchanged)
+# JSON & SQLite helpers
 # ----------------------------------------------------------------------
 def load_json(filename, default):
     if not os.path.exists(filename):
@@ -204,7 +207,7 @@ def load_users() -> Set[int]:
 def save_users(users: Set[int]):
     save_json(USERS_FILE, list(users))
 
-# ---------- SQLite helpers (unchanged) ----------
+# ---------- SQLite helpers ----------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -293,7 +296,9 @@ def credit_user(user_id, amount_bdt):
     row = conn.execute("SELECT last_reset_date FROM users WHERE user_id=?", (user_id,)).fetchone()
     last_reset = row[0] if row else ""
     if last_reset != today_str:
+        # Reset daily counters
         conn.execute("UPDATE users SET today_otps=0, today_earned=0.0, last_reset_date=? WHERE user_id=?", (today_str, user_id))
+    # Increment
     conn.execute("UPDATE users SET balance_bdt = balance_bdt + ?, today_otps = today_otps + 1, today_earned = today_earned + ?, total_earned = total_earned + ? WHERE user_id=?",
                  (amount_bdt, amount_bdt, amount_bdt, user_id))
     conn.commit()
@@ -402,12 +407,24 @@ def get_user_stats(user_id):
     numbers_used = sum(1 for v in assigned.values() if isinstance(v, dict) and v.get("user_id") == user_id)
     conn = sqlite3.connect(DB_FILE)
     row = conn.execute("SELECT today_otps, today_earned, total_earned FROM users WHERE user_id=?", (user_id,)).fetchone()
-    today_otps = row[0] or 0 if row else 0
-    today_earned = row[1] or 0.0 if row else 0.0
-    total_earned = row[2] or 0.0 if row else 0.0
-    total_withdrawn = conn.execute("SELECT COALESCE(SUM(amount_bdt), 0) FROM withdraw_requests WHERE user_id=? AND status='completed'", (user_id,)).fetchone()[0]
+    if row:
+        today_otps = row[0] or 0
+        today_earned = row[1] or 0.0
+        total_earned = row[2] or 0.0
+    else:
+        today_otps = 0
+        today_earned = 0.0
+        total_earned = 0.0
+    total_withdrawn_row = conn.execute("SELECT COALESCE(SUM(amount_bdt), 0) FROM withdraw_requests WHERE user_id=? AND status='completed'", (user_id,)).fetchone()
+    total_withdrawn = total_withdrawn_row[0] if total_withdrawn_row else 0.0
     conn.close()
-    return {"numbers_used": numbers_used, "today_otps": today_otps, "today_earned": today_earned, "total_earned": total_earned, "total_withdrawn": total_withdrawn}
+    return {
+        "numbers_used": numbers_used,
+        "today_otps": today_otps,
+        "today_earned": today_earned,
+        "total_earned": total_earned,
+        "total_withdrawn": total_withdrawn
+    }
 
 def get_admin_stats():
     assigned = load_assigned()
@@ -416,59 +433,91 @@ def get_admin_stats():
     row = conn.execute("SELECT COALESCE(SUM(today_otps),0), COALESCE(SUM(today_earned),0) FROM users").fetchone()
     today_otps = row[0] or 0
     today_earned = row[1] or 0.0
-    total_withdrawn = conn.execute("SELECT COALESCE(SUM(amount_bdt), 0) FROM withdraw_requests WHERE status='completed'").fetchone()[0]
+    total_withdrawn_row = conn.execute("SELECT COALESCE(SUM(amount_bdt), 0) FROM withdraw_requests WHERE status='completed'").fetchone()
+    total_withdrawn = total_withdrawn_row[0] if total_withdrawn_row else 0.0
     conn.close()
-    return {"numbers_used": total_numbers, "today_otps": today_otps, "today_earned": today_earned, "total_withdrawn": total_withdrawn}
+    return {
+        "numbers_used": total_numbers,
+        "today_otps": today_otps,
+        "today_earned": today_earned,
+        "total_withdrawn": total_withdrawn
+    }
 
 # ----------------------------------------------------------------------
 # Keyboard helper
 # ----------------------------------------------------------------------
-def build_menu_buttons(buttons, header_buttons=None, footer_buttons=None):
+def build_menu_buttons(buttons: List[InlineKeyboardButton],
+                       header_buttons: List[InlineKeyboardButton] = None,
+                       footer_buttons: List[InlineKeyboardButton] = None) -> InlineKeyboardMarkup:
     menu = []
     if header_buttons:
         menu.append(header_buttons)
     for i in range(0, len(buttons), 2):
-        menu.append(buttons[i:i+2])
+        row = buttons[i:i+2]
+        menu.append(row)
     if footer_buttons:
         menu.append(footer_buttons)
     return InlineKeyboardMarkup(menu)
 
 # ----------------------------------------------------------------------
-# Channel membership check
+# Channel membership check & prompt
 # ----------------------------------------------------------------------
-async def is_member_of_channel(bot, user_id: int) -> bool:
-    if not REQUIRED_CHANNEL_USERNAME:
-        return True
+async def is_member(bot: Bot, user_id: int) -> bool:
     try:
-        member = await bot.get_chat_member(f"@{REQUIRED_CHANNEL_USERNAME}", user_id)
+        member = await bot.get_chat_member(chat_id=GROUP_CHAT_ID, user_id=user_id)
         return member.status not in ("left", "kicked")
-    except (BadRequest, Exception):
+    except Exception:
         return False
 
-async def enforce_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user = update.effective_user
-    if await is_member_of_channel(context.bot, user.id):
-        return True
+async def send_join_prompt(target, bot: Bot, user_id: int):
+    text = (
+        "🔒 <b>Access Restricted!</b>\n\n"
+        "Please join our channel to use this bot."
+    )
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{REQUIRED_CHANNEL_USERNAME}")],
+        [InlineKeyboardButton("📢 Join Channel", url=CHANNEL_INVITE_LINK)],
         [InlineKeyboardButton("✅ Verify", callback_data="verify_join")]
     ])
-    text = "🔒 <b>Access Restricted!</b>\n\nPlease join our channel to use this bot."
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    if hasattr(target, 'message'):
+        await target.message.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    elif hasattr(target, 'edit_message_text'):
+        await target.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-    return False
+        await target.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
 
 async def verify_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if await is_member_of_channel(context.bot, query.from_user.id):
-        await query.edit_message_text("✅ <b>Verified!</b> Welcome back.", parse_mode=ParseMode.HTML)
-        await start(update, context)
+    if await is_member(context.bot, query.from_user.id):
+        await show_main_menu(update, context)
     else:
         await query.answer("❌ You haven't joined yet. Please join and try again.", show_alert=True)
-    return ConversationHandler.END
+
+async def ensure_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check membership. If not a member, send join prompt and return False."""
+    user_id = update.effective_user.id
+    if await is_member(context.bot, user_id):
+        return True
+    if update.callback_query:
+        await send_join_prompt(update.callback_query, context.bot, user_id)
+    else:
+        await send_join_prompt(update, context.bot, user_id)
+    return False
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send the main menu after successful verification / start."""
+    user = update.effective_user
+    users = load_users()
+    users.add(user.id)
+    save_users(users)
+    keyboard = [
+        ["Get Number", "Fake Name"],
+        ["Get 2FA", "👤 My Profile"]
+    ]
+    if update.callback_query:
+        await update.callback_query.message.reply_text("Welcome! Choose an option:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    else:
+        await update.message.reply_text("Welcome! Choose an option:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
 
 # ----------------------------------------------------------------------
 # Site login (generic)
@@ -513,7 +562,7 @@ def site_login(session, base_url, username, password, retries=3) -> bool:
     return False
 
 # ----------------------------------------------------------------------
-# Generic Site Data Fetcher
+# Generic Site Data Fetcher (used by Site1, Site6)
 # ----------------------------------------------------------------------
 def fetch_data_sync_generic(session, base_url) -> Optional[list]:
     today = datetime.now()
@@ -568,39 +617,54 @@ async def fetch_data_async_generic(session, base_url) -> Optional[list]:
 def fetch_data_sync_site2_api() -> Optional[list]:
     token = SITE2_API_TOKEN
     if not token:
-        logger.error("SITE2_API_TOKEN is not set.")
+        logger.error("SITE2_API_TOKEN is not set. Cannot fetch Site2 data.")
         return None
+
     today = datetime.now()
     dt1 = (today - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
     dt2 = (today + timedelta(days=1)).strftime("%Y-%m-%d 23:59:59")
-    params = {"token": token, "dt1": dt1, "dt2": dt2, "records": 200}
+
+    params = {
+        "token": token,
+        "dt1": dt1,
+        "dt2": dt2,
+        "records": 200
+    }
+
     for attempt in range(1, INTERNAL_RETRIES + 1):
         try:
             resp = requests.get(SITE2_API_URL, params=params, timeout=REQUEST_TIMEOUT)
         except Exception as e:
-            logger.warning(f"Site2 API attempt {attempt} failed: {e}")
+            logger.warning(f"Site2 API request attempt {attempt} failed: {e}")
             time.sleep(2)
             continue
+
         if resp.status_code == 200:
             if "Error, you've accessed this site too many times" in resp.text:
                 wait_match = re.search(r"Try again in (\d+) seconds?\.", resp.text)
                 wait_seconds = int(wait_match.group(1)) if wait_match else 3
+                logger.warning(f"Rate limit hit. Waiting {wait_seconds + 2}s before retry.")
                 time.sleep(wait_seconds + 2)
                 continue
             try:
                 json_data = resp.json()
             except Exception:
-                logger.error(f"JSON decode failed for Site2 API.")
+                logger.error(f"JSON decode failed for Site2 API. Response: {resp.text[:300]}")
                 time.sleep(2)
                 continue
+
             rows = json_data.get("data") or json_data.get("aaData") or json_data
             if isinstance(rows, dict):
                 rows = [rows]
             if not isinstance(rows, list):
-                logger.error(f"Unexpected API response format.")
+                logger.error(f"Unexpected API response format: {type(rows)}")
                 return None
+
             normalised = []
-            number_keys = ["number", "Number", "phone", "Phone", "msisdn", "MSISDN", "destination", "Destination", "to", "To", "num", "Num"]
+            number_keys = [
+                "number", "Number", "phone", "Phone", "msisdn", "MSISDN",
+                "destination", "Destination", "to", "To", "num", "Num"
+            ]
             for row in rows:
                 if isinstance(row, list):
                     normalised.append(row)
@@ -623,10 +687,14 @@ def fetch_data_sync_site2_api() -> Optional[list]:
                         row.get("my_payout") or row.get("MyPayout") or row.get("payout") or "",
                         row.get("client_payout") or row.get("ClientPayout") or ""
                     ])
+                else:
+                    continue
             return normalised
         else:
             logger.warning(f"Site2 API HTTP {resp.status_code}")
             time.sleep(2)
+            continue
+
     logger.error("All API attempts failed for Site2.")
     return None
 
@@ -697,34 +765,17 @@ async def fetch_data_async_site4(session, data_url) -> Optional[list]:
     return await asyncio.to_thread(fetch_data_sync_site4_from_url, session, data_url)
 
 # ----------------------------------------------------------------------
-# ** IMPROVED OTP extraction **
+# OTP extraction & seen pairs
 # ----------------------------------------------------------------------
 def extract_otp(sms_text: str) -> Optional[str]:
     if not isinstance(sms_text, str):
         return None
-
-    # 1) Classic "# 123456 is your ..."
     match = re.search(r"#\s*((?:\d+\s*)+?)\s*is\s+your", sms_text)
     if match:
         return re.sub(r"\s+", "", match.group(1))
-
-    # 2) "code/otp/pin: 123456" (with optional dash)
-    match = re.search(r"(?:code|otp|pin|password)\s*[:\s]?\s*(\d[\d\s\-]+)", sms_text, re.IGNORECASE)
-    if match:
-        digits = re.sub(r"[^\d]", "", match.group(1))
-        if 3 <= len(digits) <= 8:
-            return digits
-
-    # 3) Fallback: first 4‑8 digit number in the whole message
-    match = re.search(r"\b(\d{4,8})\b", sms_text)
-    if match:
-        return match.group(1)
-
-    # 4) Last resort: "# 123456" style (broad)
-    match = re.search(r"#\s*(\d[\d\s]+)", sms_text)
-    if match:
-        return re.sub(r"\s+", "", match.group(1))
-
+    match2 = re.search(r"#\s*(\d[\d\s]+)", sms_text)
+    if match2:
+        return re.sub(r"\s+", "", match2.group(1))
     return None
 
 def load_seen_pairs(filename) -> Set[str]:
@@ -754,9 +805,6 @@ def mask_number(num: str) -> str:
     return num[:4] + "*" * (len(num) - 7) + num[-3:]
 
 async def send_otp_to_group(bot: Bot, row: list, otp: str, country: str = ""):
-    if not GROUP_CHAT_ID:
-        logger.warning("GROUP_CHAT_ID not set. Skipping group notification.")
-        return
     number = str(row[2]).strip()
     cli = str(row[3]).strip() if len(row) > 3 else ""
     sms = str(row[5]).strip() if len(row) > 5 else ""
@@ -778,7 +826,8 @@ async def send_otp_to_group(bot: Bot, row: list, otp: str, country: str = ""):
         logger.error(f"Failed to send to group: {e}")
 
 async def send_otp_to_user(bot: Bot, user_id: int, row: list, otp: str,
-                           old_balance: float, new_balance: float, country: str = ""):
+                           old_balance: float, new_balance: float,
+                           country: str = ""):
     number = str(row[2]).strip()
     sms = str(row[5]).strip() if len(row) > 5 else ""
     if not number.startswith("+"):
@@ -806,9 +855,11 @@ async def generic_monitor(application: Application, session, base_url, username,
                           seen_file, label, check_interval):
     bot = application.bot
     login_failures = 0
+
     if not site_login(session, base_url, username, password):
         logger.critical(f"Initial login failed for {label}. Will retry after backoff.")
         login_failures = 1
+
     seen_pairs = load_seen_pairs(seen_file)
     if login_failures == 0:
         rows = await fetch_data_async_generic(session, base_url)
@@ -816,6 +867,7 @@ async def generic_monitor(application: Application, session, base_url, username,
             for row in rows:
                 if len(row) < 9: continue
                 sms_text = str(row[5])
+                if "#" not in sms_text: continue
                 otp = extract_otp(sms_text)
                 if not otp: continue
                 number = str(row[2]).strip()
@@ -838,6 +890,7 @@ async def generic_monitor(application: Application, session, base_url, username,
             if site_login(session, base_url, username, password):
                 login_failures = 0
                 consecutive_failures = 0
+                logger.info(f"[{label}] Login succeeded after {backoff}s wait.")
             else:
                 login_failures += 1
                 logger.warning(f"[{label}] Login still failing. Next retry in {min(LOGIN_FAILURE_BASE_BACKOFF * login_failures, LOGIN_FAILURE_MAX_BACKOFF)}s.")
@@ -876,6 +929,7 @@ async def generic_monitor(application: Application, session, base_url, username,
         for row in rows:
             if len(row) < 9: continue
             sms_text = str(row[5])
+            if "#" not in sms_text: continue
             otp = extract_otp(sms_text)
             if not otp: continue
             number = str(row[2]).strip()
@@ -885,7 +939,6 @@ async def generic_monitor(application: Application, session, base_url, username,
             seen_pairs.add(pair)
             save_seen_pair(seen_file, number, otp)
             new_otp_count += 1
-            logger.info(f"[{label}] New OTP: {otp} for {number} (SMS: {sms_text[:50]}...)")
 
             assign_data = normalised_assigned.get(normalise_number(number), {})
             user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
@@ -903,7 +956,7 @@ async def generic_monitor(application: Application, session, base_url, username,
         await asyncio.sleep(check_interval)
 
 # ----------------------------------------------------------------------
-# Site 2 Monitor (API) – token invalid handling
+# Site 2 Monitor (API)
 # ----------------------------------------------------------------------
 async def monitor_site2(application: Application):
     seen_file = "seen_pairs_site2.txt"
@@ -911,12 +964,14 @@ async def monitor_site2(application: Application):
     check_interval = SITE2_CHECK_INTERVAL
     bot = application.bot
     login_failures = 0
+
     seen_pairs = load_seen_pairs(seen_file)
     rows = await fetch_data_async_site2_api()
     if rows:
         for row in rows:
             if len(row) < 9: continue
             sms_text = str(row[5])
+            if "#" not in sms_text: continue
             otp = extract_otp(sms_text)
             if not otp: continue
             number = str(row[2]).strip()
@@ -928,12 +983,14 @@ async def monitor_site2(application: Application):
     else:
         logger.warning(f"[{label}] Initial API fetch returned no rows. Will keep trying.")
         login_failures = 1
+
     consecutive_failures = 0
     while True:
         if login_failures > 0:
             backoff = min(LOGIN_FAILURE_BASE_BACKOFF * login_failures, LOGIN_FAILURE_MAX_BACKOFF)
             logger.info(f"[{label}] Waiting {backoff}s before next API attempt due to persistent failure.")
             await asyncio.sleep(backoff)
+
         rows = await fetch_data_async_site2_api()
         if rows is None:
             consecutive_failures += 1
@@ -946,6 +1003,7 @@ async def monitor_site2(application: Application):
         else:
             consecutive_failures = 0
             login_failures = 0
+
         assigned = load_assigned()
         normalised_assigned = {normalise_number(k): v for k, v in assigned.items()}
         per_otp = float(get_setting("per_otp_bdt", "0.30"))
@@ -953,18 +1011,23 @@ async def monitor_site2(application: Application):
         for row in rows:
             if len(row) < 9: continue
             sms_text = str(row[5])
+            if "#" not in sms_text: continue
             otp = extract_otp(sms_text)
             if not otp: continue
             number = str(row[2]).strip()
-            if not number: continue
+            if not number:
+                continue
             pair = f"{number}|{otp}"
-            if pair in seen_pairs: continue
+            if pair in seen_pairs:
+                continue
             seen_pairs.add(pair)
             save_seen_pair(seen_file, number, otp)
             new_otp_count += 1
+
             assign_data = normalised_assigned.get(normalise_number(number), {})
             user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
             country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
+
             tasks = [send_otp_to_group(bot, row, otp, country=country)]
             if user_id:
                 old_balance = get_user_balance(user_id)
@@ -1004,6 +1067,7 @@ async def monitor_site4(application: Application):
             for row in rows:
                 if len(row) < 9: continue
                 sms_text = str(row[5])
+                if "#" not in sms_text: continue
                 otp = extract_otp(sms_text)
                 if not otp: continue
                 number = str(row[2]).strip()
@@ -1025,6 +1089,7 @@ async def monitor_site4(application: Application):
                 login_failures = 0
                 consecutive_failures = 0
                 data_url = get_site4_data_url(session, base_url)
+                logger.info(f"[{label}] Login succeeded after {backoff}s wait.")
             else:
                 login_failures += 1
                 logger.warning(f"[{label}] Login still failing. Next retry in {min(LOGIN_FAILURE_BASE_BACKOFF * login_failures, LOGIN_FAILURE_MAX_BACKOFF)}s.")
@@ -1037,6 +1102,7 @@ async def monitor_site4(application: Application):
                 data_url = get_site4_data_url(session, base_url)
                 if data_url:
                     consecutive_failures = 0
+                    logger.info(f"[{label}] Re‑login and URL extraction successful.")
                 else:
                     consecutive_failures += 1
             else:
@@ -1073,17 +1139,21 @@ async def monitor_site4(application: Application):
         for row in rows:
             if len(row) < 9: continue
             sms_text = str(row[5])
+            if "#" not in sms_text: continue
             otp = extract_otp(sms_text)
             if not otp: continue
             number = str(row[2]).strip()
             pair = f"{number}|{otp}"
-            if pair in seen_pairs: continue
+            if pair in seen_pairs:
+                continue
             seen_pairs.add(pair)
             save_seen_pair(seen_file, number, otp)
             new_otp_count += 1
+
             assign_data = normalised_assigned.get(normalise_number(number), {})
             user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
             country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
+
             tasks = [send_otp_to_group(bot, row, otp, country=country)]
             if user_id:
                 old_balance = get_user_balance(user_id)
@@ -1107,23 +1177,15 @@ def check_get_number_rate_limit(user_id):
     return True, 0
 
 # ----------------------------------------------------------------------
-# Telegram handlers (with channel check)
+# Telegram handlers
 # ----------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await enforce_channel(update, context):
-        return ConversationHandler.END
-    user = update.effective_user
-    users = load_users()
-    users.add(user.id)
-    save_users(users)
-    keyboard = [
-        ["Get Number", "Fake Name"],
-        ["Get 2FA", "👤 My Profile"]
-    ]
-    await update.message.reply_text("Welcome! Choose an option:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    if not await ensure_member(update, context):
+        return
+    await show_main_menu(update, context)
 
 async def get_number_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await enforce_channel(update, context):
+    if not await ensure_member(update, context):
         return
     if is_banned(update.effective_user.id):
         await update.message.reply_text("🚫 You are temporarily banned for 5 minutes due to flooding.")
@@ -1137,6 +1199,8 @@ async def get_number_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Choose a service:", reply_markup=keyboard)
 
 async def get_main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_member(update, context):
+        return
     query = update.callback_query
     await query.answer()
     main_name = query.data.split(":",1)[1]
@@ -1167,11 +1231,14 @@ async def get_main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=keyboard
         )
         return
+
     buttons = [InlineKeyboardButton(sub, callback_data=f"get_sub:{main_name}:{sub}") for sub in subs]
     keyboard = build_menu_buttons(buttons)
     await query.edit_message_text(f"Select a sub‑category for {main_name}:", reply_markup=keyboard)
 
 async def get_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_member(update, context):
+        return
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -1183,6 +1250,8 @@ async def get_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await assign_number_and_display(query, main_name, sub_name, user_id, context)
 
 async def change_number_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_member(update, context):
+        return
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -1223,6 +1292,7 @@ async def change_number_callback(update: Update, context: ContextTypes.DEFAULT_T
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=keyboard
         )
+        return
 
 async def assign_number_and_display(query_or_update, main_name, sub_name, user_id, context=None):
     pool_key = f"{main_name}_{sub_name}"
@@ -1254,15 +1324,15 @@ async def assign_number_and_display(query_or_update, main_name, sub_name, user_i
     else:
         await query_or_update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
-# ── Fake Name flow (only Change Details button) ──
+# ── Fake Name flow ──
 FAKE_GENDER = 1
 
 async def fake_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await enforce_channel(update, context):
-        return ConversationHandler.END
+    if not await ensure_member(update, context):
+        return
     if is_banned(update.effective_user.id):
         await update.message.reply_text("🚫 Banned.")
-        return ConversationHandler.END
+        return
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("👨 Male", callback_data="fake_male"),
          InlineKeyboardButton("👩 Female", callback_data="fake_female")]
@@ -1295,7 +1365,10 @@ async def fake_gender_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"<b>Password:</b> <code>{password}</code>"
     )
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Change Details", callback_data=f"fake_{gender}")]
+        [InlineKeyboardButton("Copy Name", copy_text=CopyTextButton(text=full_name)),
+         InlineKeyboardButton("Copy Username", copy_text=CopyTextButton(text=username))],
+        [InlineKeyboardButton("Copy Password", copy_text=CopyTextButton(text=password))],
+        [InlineKeyboardButton("Change Details", callback_data=f"fake_{gender}")]
     ])
     await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
     return FAKE_GENDER
@@ -1304,11 +1377,11 @@ async def fake_gender_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
 GET2FA_SECRET = 1
 
 async def get2fa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await enforce_channel(update, context):
-        return ConversationHandler.END
+    if not await ensure_member(update, context):
+        return
     if is_banned(update.effective_user.id):
         await update.message.reply_text("🚫 Banned.")
-        return ConversationHandler.END
+        return
     await update.message.reply_text(
         "📲 <b>Paste your 2FA Secret Key</b>\n\n"
         "<i>Example: JBSWY3DPEHPK3PXP</i>",
@@ -1339,7 +1412,7 @@ async def get2fa_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Error generating code. Check your secret.")
     return ConversationHandler.END
 
-# ── Admin handlers (unchanged) ──
+# ── Admin handlers ──
 ADD_MAIN, REMOVE_MAIN_SELECT = range(2)
 
 async def add_remove_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1558,8 +1631,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 PROFILE_SELECT, SET_WALLET_METHOD, SET_WALLET_VALUE, WITHDRAW_METHOD, WITHDRAW_AMOUNT, EDIT_MENU, EDIT_PRICE, EDIT_RATE = range(8)
 
 async def profile_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await enforce_channel(update, context):
-        return ConversationHandler.END
+    if not await ensure_member(update, context):
+        return
     user_id = update.effective_user.id
     if is_admin(user_id):
         await update.message.reply_text("👤 Profile Menu", reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True))
@@ -1635,14 +1708,17 @@ async def profile_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "Status":
         stats = get_user_stats(user_id)
         ex_rate = 125.0
+        today_earned_usd = stats['today_earned'] / ex_rate
+        total_earned_usd = stats['total_earned'] / ex_rate
+        total_withdrawn_usd = stats['total_withdrawn'] / ex_rate
         msg = (
             f"📊 <b>YOUR STATISTICS</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📞 Numbers Used: {stats['numbers_used']}\n"
             f"📩 Today's OTPs: {stats['today_otps']}\n"
-            f"💰 Today's Earned: {stats['today_earned']:.2f} BDT / ${stats['today_earned']/ex_rate:.4f} USDT\n"
-            f"💵 Total Earned: {stats['total_earned']:.2f} BDT / ${stats['total_earned']/ex_rate:.4f} USDT\n"
-            f"💳 Total Withdrawn: {stats['total_withdrawn']:.2f} BDT / ${stats['total_withdrawn']/ex_rate:.4f} USDT\n"
+            f"💰 Today's Earned: {stats['today_earned']:.2f} BDT / ${today_earned_usd:.4f} USDT\n"
+            f"💵 Total Earned: {stats['total_earned']:.2f} BDT / ${total_earned_usd:.4f} USDT\n"
+            f"💳 Total Withdrawn: {stats['total_withdrawn']:.2f} BDT / ${total_withdrawn_usd:.4f} USDT\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📢 <b>{ORBITX_SMS_FOOTER}</b>"
         )
@@ -1651,13 +1727,15 @@ async def profile_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "Users status" and is_admin(user_id):
         stats = get_admin_stats()
         ex_rate = 125.0
+        today_earned_usd = stats['today_earned'] / ex_rate
+        total_withdrawn_usd = stats['total_withdrawn'] / ex_rate
         msg = (
             f"📊 <b>USERS STATISTICS</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📞 Numbers Used: {stats['numbers_used']}\n"
             f"📩 Today's OTPs: {stats['today_otps']}\n"
-            f"💰 Today's Cost: {stats['today_earned']:.2f} BDT / ${stats['today_earned']/ex_rate:.4f} USDT\n"
-            f"💳 Total Withdrawn: {stats['total_withdrawn']:.2f} BDT / ${stats['total_withdrawn']/ex_rate:.4f} USDT\n"
+            f"💰 Today's Cost: {stats['today_earned']:.2f} BDT / ${today_earned_usd:.4f} USDT\n"
+            f"💳 Total Withdrawn: {stats['total_withdrawn']:.2f} BDT / ${total_withdrawn_usd:.4f} USDT\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📢 <b>{ORBITX_SMS_FOOTER}</b>"
         )
@@ -1821,6 +1899,9 @@ async def admin_complete_callback(update: Update, context: ContextTypes.DEFAULT_
 def main():
     application = Application.builder().token(TOKEN).build()
 
+    # Channel verification handler
+    application.add_handler(CallbackQueryHandler(verify_join_callback, pattern="^verify_join$"))
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.Regex("^Get Number$"), get_number_start))
     application.add_handler(CallbackQueryHandler(get_main_callback, pattern="^get_main:"))
@@ -1828,10 +1909,7 @@ def main():
     application.add_handler(CallbackQueryHandler(change_number_callback, pattern="^change_number:"))
     application.add_handler(CallbackQueryHandler(admin_complete_callback, pattern="^admin_complete_"))
 
-    # Verify join callback
-    application.add_handler(CallbackQueryHandler(verify_join_callback, pattern="^verify_join$"))
-
-    # Fake Name conversation
+    # Fake Name conversation with fallback
     fake_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Fake Name$"), fake_name_start)],
         states={
@@ -1923,7 +2001,7 @@ def main():
 
     application.post_init = post_init
 
-    logger.info("Bot started (Site1, Site2, Site4, Site6) with channel enforcement. Polling...")
+    logger.info("Bot started (Site1, Site2, Site4, Site6) with channel join verification. Polling...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
