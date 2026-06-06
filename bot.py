@@ -143,7 +143,7 @@ session6.headers.update({
 last_get_number: Dict[int, float] = {}
 
 # ----------------------------------------------------------------------
-# JSON & SQLite helpers
+# JSON & SQLite helpers (unchanged)
 # ----------------------------------------------------------------------
 def load_json(filename, default):
     if not os.path.exists(filename):
@@ -204,7 +204,7 @@ def load_users() -> Set[int]:
 def save_users(users: Set[int]):
     save_json(USERS_FILE, list(users))
 
-# ---------- SQLite helpers ----------
+# ---------- SQLite helpers (unchanged) ----------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -703,11 +703,9 @@ async def fetch_data_async_site4(session, data_url) -> Optional[list]:
 def extract_otp(sms_text: str) -> Optional[str]:
     if not isinstance(sms_text, str):
         return None
-    # Match "# 123456 is your ..."
     match = re.search(r"#\s*((?:\d+\s*)+?)\s*is\s+your", sms_text)
     if match:
         return re.sub(r"\s+", "", match.group(1))
-    # Match "# 123456" at start of a line
     match2 = re.search(r"#\s*(\d[\d\s]+)", sms_text)
     if match2:
         return re.sub(r"\s+", "", match2.group(1))
