@@ -8,6 +8,7 @@ import sqlite3
 import string
 import time
 import warnings
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Set, Optional
 
@@ -34,7 +35,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# --- Disable SSL warnings for sites with problematic certificates ---
+# --- Disable SSL warnings ---
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -46,8 +47,8 @@ load_dotenv()
 
 # ---------- Configuration ----------
 TOKEN = os.getenv("BOT_TOKEN")
-GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")          # e.g. "-1001234567890"
-GROUP_INVITE_LINK = os.getenv("GROUP_INVITE_LINK", "")  # invite link for forced join
+GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
+GROUP_INVITE_LINK = os.getenv("GROUP_INVITE_LINK", "")
 admin_ids_str = os.getenv("ADMIN_CHAT_IDS", "")
 ADMIN_CHAT_IDS = {int(x.strip()) for x in admin_ids_str.split(",") if x.strip().isdigit()}
 if not ADMIN_CHAT_IDS:
@@ -68,7 +69,7 @@ SITE2_API_URL = os.getenv("SITE2_API_URL", "http://147.135.212.197/crapi/had/vie
 SITE2_API_TOKEN = os.getenv("SITE2_API_TOKEN", "")
 SITE2_CHECK_INTERVAL = int(os.getenv("SITE2_CHECK_INTERVAL", "18"))
 
-# --- Site 3 (KmSMS) – NOW API BASED ---
+# --- Site 3 (API) ---
 SITE3_API_URL = os.getenv("SITE3_API_URL", "http://51.77.216.195/crapi/kmc/viewstats")
 SITE3_API_TOKEN = os.getenv("SITE3_API_TOKEN", "")
 SITE3_CHECK_INTERVAL = int(os.getenv("SITE3_CHECK_INTERVAL", "10"))
@@ -97,6 +98,11 @@ RETRY_BACKOFF = 15
 MAX_BACKOFF = 120
 REQUEST_TIMEOUT = 60
 
+# Rate limiting settings
+RATE_LIMIT_WINDOW = 60  # seconds
+RATE_LIMIT_MAX_REQUESTS = 15  # max requests per window
+RATE_LIMIT_BAN_MINUTES = 10
+
 # JSON data files
 MAIN_BUTTONS_FILE = "main_buttons.json"
 SUB_BUTTONS_FILE = "sub_buttons.json"
@@ -114,7 +120,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("sms_otp_bot")
 
-# Sessions (site3 session no longer needed, but kept for compatibility)
+# Sessions
 session1 = requests.Session()
 session1.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -160,10 +166,68 @@ session7.headers.update({
 })
 
 last_get_number: Dict[int, float] = {}
-membership_cache: Dict[int, float] = {}  # user_id -> last check timestamp
+membership_cache: Dict[int, float] = {}
+# Rate limiting: user_id -> deque of timestamps (seconds)
+user_request_timestamps: Dict[int, deque] = defaultdict(lambda: deque(maxlen=RATE_LIMIT_MAX_REQUESTS))
 
 # ----------------------------------------------------------------------
-# JSON & SQLite helpers
+# Rate limiting helper
+# ----------------------------------------------------------------------
+def check_global_rate_limit(user_id: int) -> bool:
+    """Return True if user is allowed, False if rate limit exceeded (and ban them)."""
+    if is_admin(user_id):
+        return True
+
+    now = time.time()
+    # Get user's request history
+    timestamps = user_request_timestamps[user_id]
+
+    # Clean old entries (older than window)
+    while timestamps and timestamps[0] < now - RATE_LIMIT_WINDOW:
+        timestamps.popleft()
+
+    # Check limit
+    if len(timestamps) >= RATE_LIMIT_MAX_REQUESTS:
+        # Rate limit exceeded -> ban user
+        ban_user(user_id, minutes=RATE_LIMIT_BAN_MINUTES)
+        logger.warning(f"User {user_id} banned for {RATE_LIMIT_BAN_MINUTES} minutes due to rate limit.")
+        return False
+
+    # Add current timestamp
+    timestamps.append(now)
+    return True
+
+async def enforce_rate_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check rate limit for the user. If exceeded, send ban message and return False."""
+    user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id if update.callback_query else None
+    if not user_id:
+        return True
+    if not check_global_rate_limit(user_id):
+        # User is banned, inform them
+        ban_until = None
+        conn = sqlite3.connect(DB_FILE)
+        row = conn.execute("SELECT until FROM banned_users WHERE user_id=?", (user_id,)).fetchone()
+        conn.close()
+        if row:
+            remaining = int(row[0] - time.time())
+            minutes_left = max(1, (remaining + 59) // 60)
+            msg = f"🚫 <b>You have been blocked for spamming!</b>\n\nPlease wait {minutes_left} minute(s) before using the bot again."
+        else:
+            msg = "🚫 <b>You have been blocked for spamming!</b>\n\nPlease wait a few minutes and try again."
+        try:
+            if update.message:
+                await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+            elif update.callback_query:
+                await update.callback_query.edit_message_text(msg, parse_mode=ParseMode.HTML)
+            else:
+                await context.bot.send_message(chat_id=user_id, text=msg, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logger.error(f"Failed to send rate limit message: {e}")
+        return False
+    return True
+
+# ----------------------------------------------------------------------
+# JSON & SQLite helpers (unchanged)
 # ----------------------------------------------------------------------
 def load_json(filename, default):
     if not os.path.exists(filename):
@@ -259,7 +323,6 @@ def init_db():
                 )''')
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_withdrawal_bdt', '20.0')")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('per_otp_bdt', '0.30')")
-    # Migration for older databases
     try:
         c.execute("ALTER TABLE users ADD COLUMN today_otps INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
@@ -475,22 +538,20 @@ def build_menu_buttons(buttons: List[InlineKeyboardButton],
     return InlineKeyboardMarkup(menu)
 
 # ----------------------------------------------------------------------
-# Forced join check
+# Forced join check (OTP Group)
 # ----------------------------------------------------------------------
 async def require_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Return True if user is member of the required group (or admin, or forced join disabled), else send join prompt."""
+    """Return True if user is member of required group, else send join prompt."""
     if not GROUP_CHAT_ID or not GROUP_INVITE_LINK:
-        return True  # forced join disabled
+        return True
 
     user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id if update.callback_query else None
     if not user_id:
         return True
 
-    # Admins bypass
     if is_admin(user_id):
         return True
 
-    # Check cache (60 sec)
     now = time.time()
     if user_id in membership_cache and now - membership_cache[user_id] < 60:
         return True
@@ -503,10 +564,8 @@ async def require_membership(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return True
     except Exception as e:
         logger.error(f"Membership check error: {e}")
-        # If bot can't check, block access for safety
-        pass
 
-    # Not a member → show prompt
+    # Not a member – show prompt
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Join Channel", url=GROUP_INVITE_LINK)],
         [InlineKeyboardButton("✅ Verify", callback_data="verify_join")]
@@ -540,7 +599,7 @@ async def verify_join_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("❌ Error checking membership. Try again later.", show_alert=True)
 
 # ----------------------------------------------------------------------
-# Site login (generic, used by Site1,4,6,7)
+# Site login (generic)
 # ----------------------------------------------------------------------
 def site_login(session, base_url, username, password, retries=3) -> bool:
     login_url = f"{base_url}/login"
@@ -582,7 +641,7 @@ def site_login(session, base_url, username, password, retries=3) -> bool:
     return False
 
 # ----------------------------------------------------------------------
-# Generic Site Data Fetcher (used by Site1, Site6, Site7)
+# Generic Data Fetcher (Site1, Site6, Site7)
 # ----------------------------------------------------------------------
 def fetch_data_sync_generic(session, base_url) -> Optional[list]:
     today = datetime.now()
@@ -722,7 +781,7 @@ async def fetch_data_async_site2_api() -> Optional[list]:
     return await asyncio.to_thread(fetch_data_sync_site2_api)
 
 # ----------------------------------------------------------------------
-# Site 3 API fetcher (NEW - replaces scraping)
+# Site 3 API fetcher
 # ----------------------------------------------------------------------
 def fetch_data_sync_site3_api() -> Optional[list]:
     token = SITE3_API_TOKEN
@@ -750,7 +809,6 @@ def fetch_data_sync_site3_api() -> Optional[list]:
             continue
 
         if resp.status_code == 200:
-            # Check for rate limiting or error messages
             if "too many times" in resp.text.lower() or "try again" in resp.text.lower():
                 wait_match = re.search(r"Try again in (\d+) seconds?\.", resp.text)
                 wait_seconds = int(wait_match.group(1)) if wait_match else 5
@@ -765,7 +823,6 @@ def fetch_data_sync_site3_api() -> Optional[list]:
                 time.sleep(2)
                 continue
 
-            # Extract rows – try common keys
             rows = json_data.get("data") or json_data.get("aaData") or json_data.get("records") or json_data
             if isinstance(rows, dict):
                 rows = [rows]
@@ -773,7 +830,6 @@ def fetch_data_sync_site3_api() -> Optional[list]:
                 logger.error(f"Site3 API unexpected format: {type(rows)}")
                 return None
 
-            # Normalise each row to a 9-element list (same as other sites)
             normalised = []
             number_keys = [
                 "number", "Number", "phone", "Phone", "msisdn", "MSISDN",
@@ -781,7 +837,6 @@ def fetch_data_sync_site3_api() -> Optional[list]:
             ]
             for row in rows:
                 if isinstance(row, list):
-                    # Ensure at least 9 elements (pad if needed)
                     while len(row) < 9:
                         row.append("")
                     normalised.append(row[:9])
@@ -793,7 +848,6 @@ def fetch_data_sync_site3_api() -> Optional[list]:
                             break
                     if not num_val:
                         continue
-                    # Build the 9-element list
                     normalised.append([
                         row.get("date") or row.get("Date") or row.get("datetime") or "",
                         row.get("range") or row.get("Range") or row.get("srange") or "",
@@ -820,7 +874,7 @@ async def fetch_data_async_site3_api() -> Optional[list]:
     return await asyncio.to_thread(fetch_data_sync_site3_api)
 
 # ----------------------------------------------------------------------
-# Site 4 helpers (unchanged)
+# Site 4 helpers
 # ----------------------------------------------------------------------
 def get_site4_data_url(session, base_url) -> Optional[str]:
     stats_url = f"{base_url}/agent/SMSCDRStats"
@@ -1046,7 +1100,7 @@ async def generic_monitor(application: Application, session, base_url, username,
         await asyncio.sleep(check_interval)
 
 # ----------------------------------------------------------------------
-# Site 2 Monitor (unchanged)
+# Site 2 Monitor
 # ----------------------------------------------------------------------
 async def monitor_site2(application: Application):
     seen_file = "seen_pairs_site2.txt"
@@ -1120,7 +1174,7 @@ async def monitor_site2(application: Application):
         await asyncio.sleep(check_interval)
 
 # ----------------------------------------------------------------------
-# Site 3 Monitor (NEW - API based, replaces old scraping monitor)
+# Site 3 Monitor (API)
 # ----------------------------------------------------------------------
 async def monitor_site3(application: Application):
     seen_file = "seen_pairs_site3.txt"
@@ -1128,10 +1182,7 @@ async def monitor_site3(application: Application):
     check_interval = SITE3_CHECK_INTERVAL
     bot = application.bot
 
-    # Load existing seen OTPs
     seen_pairs = load_seen_pairs(seen_file)
-
-    # Initial fetch to populate seen pairs
     rows = await fetch_data_async_site3_api()
     if rows:
         for row in rows:
@@ -1165,7 +1216,6 @@ async def monitor_site3(application: Application):
         normalised_assigned = {normalise_number(k): v for k, v in assigned.items()}
         per_otp = float(get_setting("per_otp_bdt", "0.30"))
         new_otp_count = 0
-
         for row in rows:
             if len(row) < 9: continue
             sms_text = str(row[5])
@@ -1178,7 +1228,6 @@ async def monitor_site3(application: Application):
             pair = f"{number}|{otp}"
             if pair in seen_pairs:
                 continue
-
             seen_pairs.add(pair)
             save_seen_pair(seen_file, number, otp)
             new_otp_count += 1
@@ -1194,13 +1243,12 @@ async def monitor_site3(application: Application):
                 new_balance = get_user_balance(user_id)
                 tasks.append(send_otp_to_user(bot, user_id, row, otp, old_balance, new_balance, country=country))
             await asyncio.gather(*tasks)
-
         if new_otp_count > 0:
             logger.info(f"[{label}] 📨 {new_otp_count} new OTP(s) processed.")
         await asyncio.sleep(check_interval)
 
 # ----------------------------------------------------------------------
-# Site 4 Monitor (unchanged)
+# Site 4 Monitor
 # ----------------------------------------------------------------------
 async def monitor_site4(application: Application):
     session = session4
@@ -1299,7 +1347,7 @@ async def monitor_site4(application: Application):
         await asyncio.sleep(check_interval)
 
 # ----------------------------------------------------------------------
-# Rate limiting
+# Rate limiting (existing get number rate limit kept, but global limiter handles all)
 # ----------------------------------------------------------------------
 def check_get_number_rate_limit(user_id):
     now = time.time()
@@ -1310,17 +1358,134 @@ def check_get_number_rate_limit(user_id):
     return True, 0
 
 # ----------------------------------------------------------------------
-# Telegram handlers (all guarded with membership check)
+# Fake Details Generator
+# ----------------------------------------------------------------------
+fake = Faker('en_US')
+
+def generate_strong_password() -> str:
+    special_chars = "!@#$%^&*"
+    chars = string.ascii_letters + string.digits + special_chars
+    password_length = random.randint(10, 12)
+    password = ''.join(random.choice(chars) for _ in range(password_length))
+    bdt_time = datetime.now() + timedelta(hours=6)
+    password += str(bdt_time.day)
+    return password
+
+def format_identity_message(gender: str) -> str:
+    if gender == 'male':
+        first_name = fake.first_name_male()
+        last_name = fake.last_name()
+        emoji = '👨'
+    else:
+        first_name = fake.first_name_female()
+        last_name = fake.last_name()
+        emoji = '👩'
+    full_name = f"{first_name} {last_name}"
+    username = f"{first_name.lower()}{last_name.lower()}{random.randint(10,99)}"
+    password = generate_strong_password()
+    return (
+        f"{emoji} <b>Generated Identity:</b>\n\n"
+        f"<b>Name:</b> <code>{full_name}</code>\n"
+        f"<b>Username:</b> <code>{username}</code>\n"
+        f"<b>Password:</b> <code>{password}</code>\n\n"
+        f"<i>Tap on the text above to copy</i>"
+    )
+
+async def fake_details_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return
+    if not await enforce_rate_limit(update, context):
+        return
+    if is_banned(update.effective_user.id):
+        await update.message.reply_text("🚫 You are temporarily banned for spamming. Please wait.")
+        return
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👨 Male", callback_data="fake_gender_male"),
+         InlineKeyboardButton("👩 Female", callback_data="fake_gender_female")]
+    ])
+    await update.message.reply_text("👤 <b>Select Gender:</b>", reply_markup=keyboard, parse_mode=ParseMode.HTML)
+
+async def fake_gender_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return
+    if not await enforce_rate_limit(update, context):
+        return
+    query = update.callback_query
+    await query.answer()
+    gender = query.data.split("_")[-1]
+    context.user_data["fake_gender"] = gender
+    message_text = format_identity_message(gender)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Change Details", callback_data="fake_change")]
+    ])
+    await query.edit_message_text(message_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+async def fake_change_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return
+    if not await enforce_rate_limit(update, context):
+        return
+    query = update.callback_query
+    await query.answer()
+    gender = context.user_data.get("fake_gender", "male")
+    message_text = format_identity_message(gender)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Change Details", callback_data="fake_change")]
+    ])
+    await query.edit_message_text(message_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+# ----------------------------------------------------------------------
+# Admin: Number Status
+# ----------------------------------------------------------------------
+async def number_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return
+    if not await enforce_rate_limit(update, context):
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Access denied.")
+        return
+
+    pools = load_pools()
+    assigned = load_assigned()
+    total_assigned = len(assigned)
+    total_numbers_in_pools = sum(len(nums) for nums in pools.values())
+
+    lines = ["📊 <b>NUMBER STATUS</b>\n", f"📞 <b>Total numbers in pools:</b> {total_numbers_in_pools}"]
+    lines.append(f"🔒 <b>Assigned numbers (in use):</b> {total_assigned}\n")
+
+    mains = load_main_buttons()
+    sub_buttons_data = load_sub_buttons()
+
+    for main in mains:
+        main_pool_key = main
+        main_count = len(pools.get(main_pool_key, []))
+        lines.append(f"\n<b>🔹 {main}</b>")
+        lines.append(f"   ├── Main category: {main_count} numbers")
+        subs = sub_buttons_data.get(main, [])
+        for sub in subs:
+            sub_pool_key = f"{main}_{sub}"
+            sub_count = len(pools.get(sub_pool_key, []))
+            lines.append(f"   ├── {sub}: {sub_count} numbers")
+        lines.append("   └── " + "─" * 20)
+
+    lines.append(f"\n📢 <b>{ORBITX_SMS_FOOTER}</b>")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+# ----------------------------------------------------------------------
+# Telegram handlers (all now include rate limit check)
 # ----------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_membership(update, context):
+        return
+    if not await enforce_rate_limit(update, context):
         return
     user = update.effective_user
     users = load_users()
     users.add(user.id)
     save_users(users)
     keyboard = [
-        ["Get Number", "Fake Name"],
+        ["Get Number", "Fake Details"],
         ["Get 2FA", "👤 My Profile"]
     ]
     await update.message.reply_text("Welcome! Choose an option:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
@@ -1328,8 +1493,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_number_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_membership(update, context):
         return
+    if not await enforce_rate_limit(update, context):
+        return
     if is_banned(update.effective_user.id):
-        await update.message.reply_text("🚫 You are temporarily banned for 5 minutes due to flooding.")
+        await update.message.reply_text("🚫 You are temporarily banned for spamming. Please wait.")
         return
     mains = load_main_buttons()
     if not mains:
@@ -1341,6 +1508,8 @@ async def get_number_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def get_main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_membership(update, context):
+        return
+    if not await enforce_rate_limit(update, context):
         return
     query = update.callback_query
     await query.answer()
@@ -1380,6 +1549,8 @@ async def get_main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_membership(update, context):
         return
+    if not await enforce_rate_limit(update, context):
+        return
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -1392,6 +1563,8 @@ async def get_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def change_number_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_membership(update, context):
+        return
+    if not await enforce_rate_limit(update, context):
         return
     query = update.callback_query
     await query.answer()
@@ -1465,62 +1638,13 @@ async def assign_number_and_display(query_or_update, main_name, sub_name, user_i
     else:
         await query_or_update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
-# ── Fake Name flow ──
-FAKE_GENDER = 1
-
-async def fake_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_membership(update, context):
-        return FAKE_GENDER
-    if is_banned(update.effective_user.id):
-        await update.message.reply_text("🚫 Banned.")
-        return ConversationHandler.END
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("👨 Male", callback_data="fake_male"),
-         InlineKeyboardButton("👩 Female", callback_data="fake_female")]
-    ])
-    await update.message.reply_text("Select gender:", reply_markup=keyboard)
-    return FAKE_GENDER
-
-async def fake_gender_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_membership(update, context):
-        return FAKE_GENDER
-    query = update.callback_query
-    await query.answer()
-    gender = query.data.split("_")[1]
-    fake = Faker()
-    if gender == 'male':
-        first = fake.first_name_male()
-        last = fake.last_name()
-    else:
-        first = fake.first_name_female()
-        last = fake.last_name()
-    full_name = f"{first} {last}"
-    username = f"{first.lower()}{last.lower()}{random.randint(10,99)}"
-    chars = string.ascii_letters + string.digits + "!@#$%^&*()_+-="
-    random_part = ''.join(random.choices(chars, k=random.randint(8,10)))
-    tz = timezone(timedelta(hours=6))
-    day = datetime.now(tz).day
-    password = f"{random_part}{day}"
-    text = (
-        f"{'👨' if gender=='male' else '👩'} <b>Generated Identity:</b>\n\n"
-        f"<b>Name:</b> {full_name}\n"
-        f"<b>Username:</b> {username}\n"
-        f"<b>Password:</b> <code>{password}</code>"
-    )
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Copy Name", copy_text=CopyTextButton(text=full_name)),
-         InlineKeyboardButton("Copy Username", copy_text=CopyTextButton(text=username))],
-        [InlineKeyboardButton("Copy Password", copy_text=CopyTextButton(text=password))],
-        [InlineKeyboardButton("Change Details", callback_data=f"fake_{gender}")]
-    ])
-    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-    return FAKE_GENDER
-
-# ── Get 2FA flow ──
+# ── Get 2FA flow (with rate limit) ──
 GET2FA_SECRET = 1
 
 async def get2fa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_membership(update, context):
+        return ConversationHandler.END
+    if not await enforce_rate_limit(update, context):
         return ConversationHandler.END
     if is_banned(update.effective_user.id):
         await update.message.reply_text("🚫 Banned.")
@@ -1534,6 +1658,8 @@ async def get2fa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def get2fa_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_membership(update, context):
+        return GET2FA_SECRET
+    if not await enforce_rate_limit(update, context):
         return GET2FA_SECRET
     secret_raw = update.message.text.strip()
     secret_clean = re.sub(r'\s+', '', secret_raw).upper()
@@ -1557,12 +1683,14 @@ async def get2fa_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Error generating code. Check your secret.")
     return ConversationHandler.END
 
-# ── Admin handlers ──
+# ── Admin handlers (all with rate limit) ──
 ADD_MAIN, REMOVE_MAIN_SELECT = range(2)
 
 async def add_remove_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("Access denied.")
+        return ConversationHandler.END
+    if not await enforce_rate_limit(update, context):
         return ConversationHandler.END
     keyboard = [["Add Main Button", "Remove Main Button"], ["⬅️ Back"]]
     await update.message.reply_text("Choose action:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
@@ -1634,6 +1762,8 @@ UPLOAD_MAIN_SELECT, UPLOAD_SUB_OPTION, UPLOAD_FILE = range(100, 103)
 async def upload_from_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("Access denied.")
+        return ConversationHandler.END
+    if not await enforce_rate_limit(update, context):
         return ConversationHandler.END
     mains = load_main_buttons()
     if not mains:
@@ -1718,6 +1848,8 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("Access denied.")
         return ConversationHandler.END
+    if not await enforce_rate_limit(update, context):
+        return ConversationHandler.END
     await update.message.reply_text("Send the content you want to broadcast (text, photo, video, file).", reply_markup=ReplyKeyboardMarkup([["⬅️ Back"]], resize_keyboard=True))
     return BROADCAST_RECEIVE
 
@@ -1752,14 +1884,14 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(f"Broadcast finished. Sent to {success}/{len(users)} users.")
     return ConversationHandler.END
 
-# ── Helper: admin profile keyboard ──
+# ── Helper: admin profile keyboard
 def admin_profile_kb():
     return [
         ["💰 Balance", "📋 Pending"],
         ["✅ Approved", "✏️ Edit"],
         ["📢 Broadcast", "Upload"],
         ["Status", "Users status"],
-        ["Add/Remove Main Button"],
+        ["📊 Number Status", "Add/Remove Main Button"],
         ["⬅️ Back"]
     ]
 
@@ -1772,11 +1904,13 @@ async def back_to_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await back_to_profile(update, context)
 
-# ── Profile menu ──
+# ── Profile menu (with rate limit) ──
 PROFILE_SELECT, SET_WALLET_METHOD, SET_WALLET_VALUE, WITHDRAW_METHOD, WITHDRAW_AMOUNT, EDIT_MENU, EDIT_PRICE, EDIT_RATE = range(8)
 
 async def profile_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_membership(update, context):
+        return ConversationHandler.END
+    if not await enforce_rate_limit(update, context):
         return ConversationHandler.END
     user_id = update.effective_user.id
     if is_admin(user_id):
@@ -1788,6 +1922,8 @@ async def profile_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def profile_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_membership(update, context):
+        return PROFILE_SELECT
+    if not await enforce_rate_limit(update, context):
         return PROFILE_SELECT
     user_id = update.effective_user.id
     text = update.message.text
@@ -1852,6 +1988,9 @@ async def profile_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await add_remove_main(update, context)
     elif text == "📢 Broadcast" and is_admin(user_id):
         return await broadcast_start(update, context)
+    elif text == "📊 Number Status" and is_admin(user_id):
+        await number_status(update, context)
+        return PROFILE_SELECT
     elif text == "Status":
         stats = get_user_stats(user_id)
         ex_rate = 125.0
@@ -1894,6 +2033,8 @@ async def profile_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def profile_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_membership(update, context):
         return ConversationHandler.END
+    if not await enforce_rate_limit(update, context):
+        return ConversationHandler.END
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -1918,6 +2059,8 @@ async def profile_callback_handler(update: Update, context: ContextTypes.DEFAULT
 async def wallet_method_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_membership(update, context):
         return SET_WALLET_METHOD
+    if not await enforce_rate_limit(update, context):
+        return SET_WALLET_METHOD
     query = update.callback_query
     await query.answer()
     method = query.data.split("_")[1]
@@ -1928,6 +2071,8 @@ async def wallet_method_select(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def wallet_value_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_membership(update, context):
+        return SET_WALLET_VALUE
+    if not await enforce_rate_limit(update, context):
         return SET_WALLET_VALUE
     user_id = update.effective_user.id
     value = update.message.text.strip()
@@ -1944,6 +2089,8 @@ async def wallet_value_received(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def withdraw_method_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_membership(update, context):
+        return WITHDRAW_METHOD
+    if not await enforce_rate_limit(update, context):
         return WITHDRAW_METHOD
     query = update.callback_query
     await query.answer()
@@ -1973,6 +2120,8 @@ async def withdraw_method_select(update: Update, context: ContextTypes.DEFAULT_T
 async def withdraw_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_membership(update, context):
         return WITHDRAW_AMOUNT
+    if not await enforce_rate_limit(update, context):
+        return WITHDRAW_AMOUNT
     user_id = update.effective_user.id
     text = update.message.text.strip()
     try:
@@ -1992,6 +2141,8 @@ async def withdraw_amount_received(update: Update, context: ContextTypes.DEFAULT
     return ConversationHandler.END
 
 async def edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await enforce_rate_limit(update, context):
+        return EDIT_MENU
     text = update.message.text
     if text == "Withdraw price":
         cur_min = get_setting("min_withdrawal_bdt", "20.0")
@@ -2007,6 +2158,8 @@ async def edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return EDIT_MENU
 
 async def edit_price_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await enforce_rate_limit(update, context):
+        return EDIT_PRICE
     text = update.message.text
     if text == "⬅️ Back":
         return await profile_start(update, context)
@@ -2022,6 +2175,8 @@ async def edit_price_received(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 async def edit_rate_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await enforce_rate_limit(update, context):
+        return EDIT_RATE
     text = update.message.text
     if text == "⬅️ Back":
         return await profile_start(update, context)
@@ -2040,6 +2195,8 @@ async def admin_complete_callback(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     await query.answer()
     if not is_admin(query.from_user.id):
+        return
+    if not await enforce_rate_limit(update, context):
         return
     req_id = int(query.data.split("_")[-1])
     result = complete_withdrawal(req_id, query.from_user.id)
@@ -2061,23 +2218,14 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.Regex("^Get Number$"), get_number_start))
+    application.add_handler(MessageHandler(filters.Regex("^Fake Details$"), fake_details_start))
+    application.add_handler(CallbackQueryHandler(fake_gender_callback, pattern="^fake_gender_"))
+    application.add_handler(CallbackQueryHandler(fake_change_callback, pattern="^fake_change$"))
+
     application.add_handler(CallbackQueryHandler(get_main_callback, pattern="^get_main:"))
     application.add_handler(CallbackQueryHandler(get_sub_callback, pattern="^get_sub:"))
     application.add_handler(CallbackQueryHandler(change_number_callback, pattern="^change_number:"))
     application.add_handler(CallbackQueryHandler(admin_complete_callback, pattern="^admin_complete_"))
-
-    # Fake Name conversation
-    fake_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Fake Name$"), fake_name_start)],
-        states={
-            FAKE_GENDER: [
-                CallbackQueryHandler(fake_gender_select, pattern="^fake_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, cancel)
-            ]
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    application.add_handler(fake_conv)
 
     get2fa_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Get 2FA$"), get2fa_start)],
@@ -2114,7 +2262,7 @@ def main():
         entry_points=[MessageHandler(filters.Regex("^👤 My Profile$"), profile_start)],
         states={
             PROFILE_SELECT: [
-                MessageHandler(filters.Regex("^(💰 Balance|📋 Pending|✅ Approved|📋 Withdraw History|✏️ Edit|Upload|📢 Broadcast|Add/Remove Main Button|⬅️ Back|Status|Users status)$"), profile_select),
+                MessageHandler(filters.Regex("^(💰 Balance|📋 Pending|✅ Approved|📋 Withdraw History|✏️ Edit|Upload|📢 Broadcast|Add/Remove Main Button|⬅️ Back|Status|Users status|📊 Number Status)$"), profile_select),
                 CallbackQueryHandler(profile_callback_handler, pattern="^(profile_set_wallet|profile_withdraw)$"),
             ],
             SET_WALLET_METHOD: [CallbackQueryHandler(wallet_method_select, pattern="^wallet_(bkash|rocket|binance)$")],
@@ -2153,14 +2301,14 @@ def main():
     async def post_init(app: Application):
         asyncio.create_task(generic_monitor(app, session1, SITE1_BASE_URL, SITE1_USERNAME, SITE1_PASSWORD, "seen_pairs_site1.txt", "Site1", SITE1_CHECK_INTERVAL))
         asyncio.create_task(monitor_site2(app))
-        asyncio.create_task(monitor_site3(app))   # Now API based
+        asyncio.create_task(monitor_site3(app))
         asyncio.create_task(monitor_site4(app))
         asyncio.create_task(generic_monitor(app, session6, SITE6_BASE_URL, SITE6_USERNAME, SITE6_PASSWORD, "seen_pairs_site6.txt", "Site6", SITE6_CHECK_INTERVAL))
         asyncio.create_task(generic_monitor(app, session7, SITE7_BASE_URL, SITE7_USERNAME, SITE7_PASSWORD, "seen_pairs_site7.txt", "Site7 (Zento)", SITE7_CHECK_INTERVAL))
 
     application.post_init = post_init
 
-    logger.info("Bot started (Site1, Site2, Site3 (API), Site4, Site6, Site7). Site3 now uses API – no more 503 errors.")
+    logger.info("Bot started with global rate limiting (15 requests/60 sec → 10 min ban).")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
