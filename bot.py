@@ -46,11 +46,10 @@ load_dotenv()
 
 # ---------- Configuration ----------
 TOKEN = os.getenv("BOT_TOKEN")
-GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
-# Multiple admins: comma-separated list of user IDs
+GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")          # e.g. "-1001234567890"
+GROUP_INVITE_LINK = os.getenv("GROUP_INVITE_LINK", "")  # invite link for forced join
 admin_ids_str = os.getenv("ADMIN_CHAT_IDS", "")
 ADMIN_CHAT_IDS = {int(x.strip()) for x in admin_ids_str.split(",") if x.strip().isdigit()}
-# Fallback to old single ADMIN_CHAT_ID if ADMIN_CHAT_IDS not set
 if not ADMIN_CHAT_IDS:
     single_admin = os.getenv("ADMIN_CHAT_ID")
     if single_admin:
@@ -69,17 +68,28 @@ SITE2_API_URL = os.getenv("SITE2_API_URL", "http://147.135.212.197/crapi/had/vie
 SITE2_API_TOKEN = os.getenv("SITE2_API_TOKEN", "")
 SITE2_CHECK_INTERVAL = int(os.getenv("SITE2_CHECK_INTERVAL", "18"))
 
+# --- Site 3 (KmSMS) – NOW API BASED ---
+SITE3_API_URL = os.getenv("SITE3_API_URL", "http://51.77.216.195/crapi/kmc/viewstats")
+SITE3_API_TOKEN = os.getenv("SITE3_API_TOKEN", "")
+SITE3_CHECK_INTERVAL = int(os.getenv("SITE3_CHECK_INTERVAL", "10"))
+
 # --- Site 4 ---
 SITE4_BASE_URL = os.getenv("SITE4_BASE_URL", "http://168.119.13.175/ints")
 SITE4_USERNAME = os.getenv("SITE4_USERNAME", "")
 SITE4_PASSWORD = os.getenv("SITE4_PASSWORD", "")
 SITE4_CHECK_INTERVAL = int(os.getenv("SITE4_CHECK_INTERVAL", "10"))
 
-# --- Site 5 (Sniper SMS) ---
-SITE5_BASE_URL = os.getenv("SITE5_BASE_URL", "http://135.125.222.224/ints")
-SITE5_USERNAME = os.getenv("SITE5_USERNAME", "")
-SITE5_PASSWORD = os.getenv("SITE5_PASSWORD", "")
-SITE5_CHECK_INTERVAL = int(os.getenv("SITE5_CHECK_INTERVAL", "10"))
+# --- Site 6 (Flyn SMS) ---
+SITE6_BASE_URL = os.getenv("SITE6_BASE_URL", "http://91.232.105.47/ints")
+SITE6_USERNAME = os.getenv("SITE6_USERNAME", "")
+SITE6_PASSWORD = os.getenv("SITE6_PASSWORD", "")
+SITE6_CHECK_INTERVAL = int(os.getenv("SITE6_CHECK_INTERVAL", "10"))
+
+# --- Site 7 (Zento SMS) ---
+SITE7_BASE_URL = os.getenv("SITE7_BASE_URL", "http://54.38.176.48/ints")
+SITE7_USERNAME = os.getenv("SITE7_USERNAME", "")
+SITE7_PASSWORD = os.getenv("SITE7_PASSWORD", "")
+SITE7_CHECK_INTERVAL = int(os.getenv("SITE7_CHECK_INTERVAL", "10"))
 
 # Shared settings
 INTERNAL_RETRIES = 3
@@ -104,7 +114,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("sms_otp_bot")
 
-# Sessions
+# Sessions (site3 session no longer needed, but kept for compatibility)
 session1 = requests.Session()
 session1.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -127,19 +137,30 @@ session4.headers.update({
     "Cache-Control": "no-cache",
 })
 
-# --- Site 5 session ---
-session5 = requests.Session()
-session5.headers.update({
+session6 = requests.Session()
+session6.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Accept": "application/json, text/javascript, */*; q=0.01",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": f"{SITE5_BASE_URL}/agent/SMSCDRReports",
+    "Referer": f"{SITE6_BASE_URL}/agent/SMSCDRStats",
+    "X-Requested-With": "XMLHttpRequest",
+    "Connection": "close",
+    "Cache-Control": "no-cache",
+})
+
+session7 = requests.Session()
+session7.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": f"{SITE7_BASE_URL}/agent/SMSCDRReports",
     "X-Requested-With": "XMLHttpRequest",
     "Connection": "close",
     "Cache-Control": "no-cache",
 })
 
 last_get_number: Dict[int, float] = {}
+membership_cache: Dict[int, float] = {}  # user_id -> last check timestamp
 
 # ----------------------------------------------------------------------
 # JSON & SQLite helpers
@@ -238,7 +259,7 @@ def init_db():
                 )''')
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_withdrawal_bdt', '20.0')")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('per_otp_bdt', '0.30')")
-    # Migration for older databases without stats columns
+    # Migration for older databases
     try:
         c.execute("ALTER TABLE users ADD COLUMN today_otps INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
@@ -293,9 +314,7 @@ def credit_user(user_id, amount_bdt):
     row = conn.execute("SELECT last_reset_date FROM users WHERE user_id=?", (user_id,)).fetchone()
     last_reset = row[0] if row else ""
     if last_reset != today_str:
-        # Reset daily counters
         conn.execute("UPDATE users SET today_otps=0, today_earned=0.0, last_reset_date=? WHERE user_id=?", (today_str, user_id))
-    # Increment
     conn.execute("UPDATE users SET balance_bdt = balance_bdt + ?, today_otps = today_otps + 1, today_earned = today_earned + ?, total_earned = total_earned + ? WHERE user_id=?",
                  (amount_bdt, amount_bdt, amount_bdt, user_id))
     conn.commit()
@@ -398,9 +417,7 @@ def set_setting(key, value):
 def is_admin(user_id):
     return user_id in ADMIN_CHAT_IDS
 
-# --- Statistics helpers ---
 def get_user_stats(user_id):
-    """Return stats dict for a single user."""
     assigned = load_assigned()
     numbers_used = sum(1 for v in assigned.values() if isinstance(v, dict) and v.get("user_id") == user_id)
     conn = sqlite3.connect(DB_FILE)
@@ -425,7 +442,6 @@ def get_user_stats(user_id):
     }
 
 def get_admin_stats():
-    """Return aggregate stats for admins."""
     assigned = load_assigned()
     total_numbers = len(assigned)
     conn = sqlite3.connect(DB_FILE)
@@ -459,7 +475,72 @@ def build_menu_buttons(buttons: List[InlineKeyboardButton],
     return InlineKeyboardMarkup(menu)
 
 # ----------------------------------------------------------------------
-# Site login (generic)
+# Forced join check
+# ----------------------------------------------------------------------
+async def require_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Return True if user is member of the required group (or admin, or forced join disabled), else send join prompt."""
+    if not GROUP_CHAT_ID or not GROUP_INVITE_LINK:
+        return True  # forced join disabled
+
+    user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id if update.callback_query else None
+    if not user_id:
+        return True
+
+    # Admins bypass
+    if is_admin(user_id):
+        return True
+
+    # Check cache (60 sec)
+    now = time.time()
+    if user_id in membership_cache and now - membership_cache[user_id] < 60:
+        return True
+
+    try:
+        chat_id = int(GROUP_CHAT_ID)
+        member = await context.bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        if member.status not in ['left', 'kicked', 'banned']:
+            membership_cache[user_id] = now
+            return True
+    except Exception as e:
+        logger.error(f"Membership check error: {e}")
+        # If bot can't check, block access for safety
+        pass
+
+    # Not a member → show prompt
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Join Channel", url=GROUP_INVITE_LINK)],
+        [InlineKeyboardButton("✅ Verify", callback_data="verify_join")]
+    ])
+    text = "🔒 <b>Access Restricted!</b>\n\nPlease join our channel to use this bot."
+    if update.message:
+        await update.message.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    else:
+        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    return False
+
+async def verify_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not GROUP_CHAT_ID:
+        await query.edit_message_text("✅ Verification disabled. Use /start.")
+        return
+    try:
+        chat_id = int(GROUP_CHAT_ID)
+        member = await context.bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        if member.status not in ['left', 'kicked', 'banned']:
+            membership_cache[user_id] = time.time()
+            await query.edit_message_text("✅ Verification successful! You can now use the bot.\nClick /start to begin.", parse_mode=ParseMode.HTML)
+        else:
+            await query.answer("❌ You are still not a member. Please join the channel first.", show_alert=True)
+    except Exception as e:
+        logger.error(f"Membership check error: {e}")
+        await query.answer("❌ Error checking membership. Try again later.", show_alert=True)
+
+# ----------------------------------------------------------------------
+# Site login (generic, used by Site1,4,6,7)
 # ----------------------------------------------------------------------
 def site_login(session, base_url, username, password, retries=3) -> bool:
     login_url = f"{base_url}/login"
@@ -501,7 +582,7 @@ def site_login(session, base_url, username, password, retries=3) -> bool:
     return False
 
 # ----------------------------------------------------------------------
-# Generic Site Data Fetcher (used by Site1, Site4, Site5)
+# Generic Site Data Fetcher (used by Site1, Site6, Site7)
 # ----------------------------------------------------------------------
 def fetch_data_sync_generic(session, base_url) -> Optional[list]:
     today = datetime.now()
@@ -551,12 +632,12 @@ async def fetch_data_async_generic(session, base_url) -> Optional[list]:
     return await asyncio.to_thread(fetch_data_sync_generic, session, base_url)
 
 # ----------------------------------------------------------------------
-# Site 2 API fetcher (unchanged)
+# Site 2 API fetcher
 # ----------------------------------------------------------------------
 def fetch_data_sync_site2_api() -> Optional[list]:
     token = SITE2_API_TOKEN
     if not token:
-        logger.error("SITE2_API_TOKEN is not set. Cannot fetch Site2 data.")
+        logger.error("SITE2_API_TOKEN is not set.")
         return None
 
     today = datetime.now()
@@ -641,6 +722,104 @@ async def fetch_data_async_site2_api() -> Optional[list]:
     return await asyncio.to_thread(fetch_data_sync_site2_api)
 
 # ----------------------------------------------------------------------
+# Site 3 API fetcher (NEW - replaces scraping)
+# ----------------------------------------------------------------------
+def fetch_data_sync_site3_api() -> Optional[list]:
+    token = SITE3_API_TOKEN
+    if not token:
+        logger.error("SITE3_API_TOKEN is not set.")
+        return None
+
+    today = datetime.now()
+    dt1 = (today - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+    dt2 = (today + timedelta(days=1)).strftime("%Y-%m-%d 23:59:59")
+
+    params = {
+        "token": token,
+        "dt1": dt1,
+        "dt2": dt2,
+        "records": 200
+    }
+
+    for attempt in range(1, INTERNAL_RETRIES + 1):
+        try:
+            resp = requests.get(SITE3_API_URL, params=params, timeout=REQUEST_TIMEOUT)
+        except Exception as e:
+            logger.warning(f"Site3 API request attempt {attempt} failed: {e}")
+            time.sleep(2)
+            continue
+
+        if resp.status_code == 200:
+            # Check for rate limiting or error messages
+            if "too many times" in resp.text.lower() or "try again" in resp.text.lower():
+                wait_match = re.search(r"Try again in (\d+) seconds?\.", resp.text)
+                wait_seconds = int(wait_match.group(1)) if wait_match else 5
+                logger.warning(f"Site3 API rate limit. Waiting {wait_seconds + 2}s.")
+                time.sleep(wait_seconds + 2)
+                continue
+
+            try:
+                json_data = resp.json()
+            except Exception:
+                logger.error(f"Site3 API JSON decode failed. Response: {resp.text[:300]}")
+                time.sleep(2)
+                continue
+
+            # Extract rows – try common keys
+            rows = json_data.get("data") or json_data.get("aaData") or json_data.get("records") or json_data
+            if isinstance(rows, dict):
+                rows = [rows]
+            if not isinstance(rows, list):
+                logger.error(f"Site3 API unexpected format: {type(rows)}")
+                return None
+
+            # Normalise each row to a 9-element list (same as other sites)
+            normalised = []
+            number_keys = [
+                "number", "Number", "phone", "Phone", "msisdn", "MSISDN",
+                "destination", "Destination", "to", "To", "num", "Num"
+            ]
+            for row in rows:
+                if isinstance(row, list):
+                    # Ensure at least 9 elements (pad if needed)
+                    while len(row) < 9:
+                        row.append("")
+                    normalised.append(row[:9])
+                elif isinstance(row, dict):
+                    num_val = ""
+                    for key in number_keys:
+                        if key in row and row[key]:
+                            num_val = str(row[key]).strip()
+                            break
+                    if not num_val:
+                        continue
+                    # Build the 9-element list
+                    normalised.append([
+                        row.get("date") or row.get("Date") or row.get("datetime") or "",
+                        row.get("range") or row.get("Range") or row.get("srange") or "",
+                        num_val,
+                        row.get("cli") or row.get("CLI") or row.get("sender") or "",
+                        row.get("client") or row.get("Client") or "",
+                        row.get("sms") or row.get("SMS") or row.get("message") or "",
+                        row.get("currency") or row.get("Currency") or "",
+                        row.get("my_payout") or row.get("MyPayout") or row.get("payout") or "",
+                        row.get("client_payout") or row.get("ClientPayout") or ""
+                    ])
+                else:
+                    continue
+            return normalised
+        else:
+            logger.warning(f"Site3 API HTTP {resp.status_code}")
+            time.sleep(2)
+            continue
+
+    logger.error("All API attempts failed for Site3.")
+    return None
+
+async def fetch_data_async_site3_api() -> Optional[list]:
+    return await asyncio.to_thread(fetch_data_sync_site3_api)
+
+# ----------------------------------------------------------------------
 # Site 4 helpers (unchanged)
 # ----------------------------------------------------------------------
 def get_site4_data_url(session, base_url) -> Optional[str]:
@@ -704,70 +883,6 @@ async def fetch_data_async_site4(session, data_url) -> Optional[list]:
     return await asyncio.to_thread(fetch_data_sync_site4_from_url, session, data_url)
 
 # ----------------------------------------------------------------------
-# Site 5 helpers (unchanged)
-# ----------------------------------------------------------------------
-def get_site5_data_url(session, base_url) -> Optional[str]:
-    """Extract the dynamic data URL from SMSCDRReports page (contains sesskey)."""
-    reports_url = f"{base_url}/agent/SMSCDRReports"
-    for attempt in range(INTERNAL_RETRIES):
-        try:
-            resp = session.get(reports_url, timeout=REQUEST_TIMEOUT)
-            if resp.status_code != 200:
-                logger.warning(f"Site5 reports page HTTP {resp.status_code} (attempt {attempt+1})")
-                time.sleep(2)
-                continue
-            match = re.search(r'"sAjaxSource":\s*"([^"]+)"', resp.text)
-            if match:
-                url = match.group(1)
-                if url.startswith("res/"):
-                    full_url = f"{base_url}/agent/{url}"
-                else:
-                    full_url = f"{base_url}/agent/{url}"
-                logger.info(f"Extracted data URL for Site5: {full_url}")
-                return full_url
-            else:
-                logger.error("sAjaxSource not found in Site5 reports page.")
-                return None
-        except Exception as e:
-            logger.error(f"Error getting Site5 data URL: {e}")
-            time.sleep(2)
-    return None
-
-def fetch_data_sync_site5(session, data_url) -> Optional[list]:
-    """Fetch data using the dynamic URL for Site5."""
-    for attempt in range(INTERNAL_RETRIES):
-        try:
-            session.headers["Referer"] = f"{SITE5_BASE_URL}/agent/SMSCDRReports"
-            resp = session.get(data_url, timeout=REQUEST_TIMEOUT)
-        except Exception as e:
-            logger.warning(f"Site5 data request attempt {attempt+1} failed: {e}")
-            time.sleep(2)
-            continue
-        if "login" in resp.url.lower():
-            logger.warning("Session expired for Site5 – re‑login needed.")
-            return None
-        if resp.status_code != 200:
-            logger.warning(f"HTTP {resp.status_code} for Site5 (attempt {attempt+1})")
-            time.sleep(2)
-            continue
-        try:
-            json_data = resp.json()
-        except Exception:
-            logger.error(f"JSON decode failed for Site5. Response: {resp.text[:300]}")
-            time.sleep(2)
-            continue
-        rows = json_data.get("aaData")
-        if rows is None:
-            logger.info("No 'aaData' in Site5 response.")
-            return []
-        return rows
-    logger.error("Data fetch failed after all retries for Site5.")
-    return None
-
-async def fetch_data_async_site5(session, data_url) -> Optional[list]:
-    return await asyncio.to_thread(fetch_data_sync_site5, session, data_url)
-
-# ----------------------------------------------------------------------
 # OTP extraction & seen pairs
 # ----------------------------------------------------------------------
 def extract_otp(sms_text: str) -> Optional[str]:
@@ -794,9 +909,6 @@ def save_seen_pair(filename, number: str, otp: str):
 def normalise_number(num: str) -> str:
     return num.strip().lstrip('+')
 
-# ----------------------------------------------------------------------
-# Formatting & sending
-# ----------------------------------------------------------------------
 def mask_number(num: str) -> str:
     if not num or not num.strip():
         return "Unknown"
@@ -852,7 +964,7 @@ async def send_otp_to_user(bot: Bot, user_id: int, row: list, otp: str,
         logger.error(f"Failed to send to user {user_id}: {e}")
 
 # ----------------------------------------------------------------------
-# Generic Monitor (Site1)
+# Generic Monitor (Site1, Site6, Site7)
 # ----------------------------------------------------------------------
 async def generic_monitor(application: Application, session, base_url, username, password,
                           seen_file, label, check_interval):
@@ -934,7 +1046,7 @@ async def generic_monitor(application: Application, session, base_url, username,
         await asyncio.sleep(check_interval)
 
 # ----------------------------------------------------------------------
-# Site 2 Monitor
+# Site 2 Monitor (unchanged)
 # ----------------------------------------------------------------------
 async def monitor_site2(application: Application):
     seen_file = "seen_pairs_site2.txt"
@@ -1008,7 +1120,87 @@ async def monitor_site2(application: Application):
         await asyncio.sleep(check_interval)
 
 # ----------------------------------------------------------------------
-# Site 4 Monitor
+# Site 3 Monitor (NEW - API based, replaces old scraping monitor)
+# ----------------------------------------------------------------------
+async def monitor_site3(application: Application):
+    seen_file = "seen_pairs_site3.txt"
+    label = "Site3 (API)"
+    check_interval = SITE3_CHECK_INTERVAL
+    bot = application.bot
+
+    # Load existing seen OTPs
+    seen_pairs = load_seen_pairs(seen_file)
+
+    # Initial fetch to populate seen pairs
+    rows = await fetch_data_async_site3_api()
+    if rows:
+        for row in rows:
+            if len(row) < 9: continue
+            sms_text = str(row[5])
+            if "#" not in sms_text: continue
+            otp = extract_otp(sms_text)
+            if not otp: continue
+            number = str(row[2]).strip()
+            pair = f"{number}|{otp}"
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                save_seen_pair(seen_file, number, otp)
+        logger.info(f"[{label}] Initialized with {len(seen_pairs)} known OTP pairs.")
+    else:
+        logger.warning(f"[{label}] Initial API fetch returned no rows. Will keep trying.")
+
+    consecutive_failures = 0
+    while True:
+        rows = await fetch_data_async_site3_api()
+        if rows is None:
+            consecutive_failures += 1
+            backoff = min(RETRY_BACKOFF * consecutive_failures, MAX_BACKOFF)
+            logger.warning(f"[{label}] API fetch failed. Consecutive: {consecutive_failures}. Waiting {backoff}s.")
+            await asyncio.sleep(backoff)
+            continue
+        else:
+            consecutive_failures = 0
+
+        assigned = load_assigned()
+        normalised_assigned = {normalise_number(k): v for k, v in assigned.items()}
+        per_otp = float(get_setting("per_otp_bdt", "0.30"))
+        new_otp_count = 0
+
+        for row in rows:
+            if len(row) < 9: continue
+            sms_text = str(row[5])
+            if "#" not in sms_text: continue
+            otp = extract_otp(sms_text)
+            if not otp: continue
+            number = str(row[2]).strip()
+            if not number:
+                continue
+            pair = f"{number}|{otp}"
+            if pair in seen_pairs:
+                continue
+
+            seen_pairs.add(pair)
+            save_seen_pair(seen_file, number, otp)
+            new_otp_count += 1
+
+            assign_data = normalised_assigned.get(normalise_number(number), {})
+            user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
+            country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
+
+            tasks = [send_otp_to_group(bot, row, otp, country=country)]
+            if user_id:
+                old_balance = get_user_balance(user_id)
+                credit_user(user_id, per_otp)
+                new_balance = get_user_balance(user_id)
+                tasks.append(send_otp_to_user(bot, user_id, row, otp, old_balance, new_balance, country=country))
+            await asyncio.gather(*tasks)
+
+        if new_otp_count > 0:
+            logger.info(f"[{label}] 📨 {new_otp_count} new OTP(s) processed.")
+        await asyncio.sleep(check_interval)
+
+# ----------------------------------------------------------------------
+# Site 4 Monitor (unchanged)
 # ----------------------------------------------------------------------
 async def monitor_site4(application: Application):
     session = session4
@@ -1051,7 +1243,6 @@ async def monitor_site4(application: Application):
                 data_url = get_site4_data_url(session, base_url)
                 if data_url:
                     consecutive_failures = 0
-                    logger.info(f"[{label}] Re‑login and URL extraction successful.")
                 else:
                     consecutive_failures += 1
             else:
@@ -1108,113 +1299,6 @@ async def monitor_site4(application: Application):
         await asyncio.sleep(check_interval)
 
 # ----------------------------------------------------------------------
-# Site 5 Monitor (improved resilience)
-# ----------------------------------------------------------------------
-async def monitor_site5(application: Application):
-    session = session5
-    base_url = SITE5_BASE_URL
-    username = SITE5_USERNAME
-    password = SITE5_PASSWORD
-    seen_file = "seen_pairs_site5.txt"
-    label = "Site5"
-    check_interval = SITE5_CHECK_INTERVAL
-    bot = application.bot
-    data_url = None
-
-    # Initial login
-    if not site_login(session, base_url, username, password):
-        logger.critical(f"Initial login failed for {label}.")
-    else:
-        data_url = get_site5_data_url(session, base_url)
-
-    seen_pairs = load_seen_pairs(seen_file)
-    if data_url:
-        rows = await fetch_data_async_site5(session, data_url)
-        if rows:
-            for row in rows:
-                if len(row) < 9: continue
-                sms_text = str(row[5])
-                if "#" not in sms_text: continue
-                otp = extract_otp(sms_text)
-                if not otp: continue
-                number = str(row[2]).strip()
-                pair = f"{number}|{otp}"
-                if pair not in seen_pairs:
-                    seen_pairs.add(pair)
-                    save_seen_pair(seen_file, number, otp)
-            logger.info(f"[{label}] Initialized with {len(seen_pairs)} known OTP pairs.")
-    else:
-        logger.warning(f"[{label}] Could not get initial data URL. Will retry.")
-
-    consecutive_failures = 0
-    while True:
-        if not data_url:
-            logger.info(f"[{label}] Data URL missing, attempting re‑login.")
-            # Force fresh session on login failure
-            session.cookies.clear()
-            if site_login(session, base_url, username, password):
-                data_url = get_site5_data_url(session, base_url)
-                if data_url:
-                    consecutive_failures = 0
-                    logger.info(f"[{label}] Re‑login and URL extraction successful.")
-                else:
-                    consecutive_failures += 1
-            else:
-                consecutive_failures += 1
-            if not data_url:
-                backoff = min(RETRY_BACKOFF * (consecutive_failures + 1), MAX_BACKOFF)
-                logger.info(f"[{label}] Still no data URL. Waiting {backoff}s.")
-                await asyncio.sleep(backoff)
-                continue
-
-        rows = await fetch_data_async_site5(session, data_url)
-        if rows is None:
-            # If session expired (redirect to login) we need to re-login
-            logger.warning(f"[{label}] Data fetch failed. Re‑login required.")
-            data_url = None
-            session.cookies.clear()
-            consecutive_failures += 1
-            backoff = min(RETRY_BACKOFF * consecutive_failures, MAX_BACKOFF)
-            logger.info(f"[{label}] Waiting {backoff}s before next attempt.")
-            await asyncio.sleep(backoff)
-            continue
-        else:
-            consecutive_failures = 0
-
-        assigned = load_assigned()
-        normalised_assigned = {normalise_number(k): v for k, v in assigned.items()}
-        per_otp = float(get_setting("per_otp_bdt", "0.30"))
-        new_otp_count = 0
-        for row in rows:
-            if len(row) < 9: continue
-            sms_text = str(row[5])
-            if "#" not in sms_text: continue
-            otp = extract_otp(sms_text)
-            if not otp: continue
-            number = str(row[2]).strip()
-            pair = f"{number}|{otp}"
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
-            save_seen_pair(seen_file, number, otp)
-            new_otp_count += 1
-
-            assign_data = normalised_assigned.get(normalise_number(number), {})
-            user_id = assign_data.get("user_id") if isinstance(assign_data, dict) else assign_data
-            country = assign_data.get("main", "") if isinstance(assign_data, dict) else ""
-
-            tasks = [send_otp_to_group(bot, row, otp, country=country)]
-            if user_id:
-                old_balance = get_user_balance(user_id)
-                credit_user(user_id, per_otp)
-                new_balance = get_user_balance(user_id)
-                tasks.append(send_otp_to_user(bot, user_id, row, otp, old_balance, new_balance, country=country))
-            await asyncio.gather(*tasks)
-        if new_otp_count > 0:
-            logger.info(f"[{label}] 📨 {new_otp_count} new OTP(s) processed.")
-        await asyncio.sleep(check_interval)
-
-# ----------------------------------------------------------------------
 # Rate limiting
 # ----------------------------------------------------------------------
 def check_get_number_rate_limit(user_id):
@@ -1226,9 +1310,11 @@ def check_get_number_rate_limit(user_id):
     return True, 0
 
 # ----------------------------------------------------------------------
-# Telegram handlers
+# Telegram handlers (all guarded with membership check)
 # ----------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return
     user = update.effective_user
     users = load_users()
     users.add(user.id)
@@ -1240,6 +1326,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Welcome! Choose an option:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
 
 async def get_number_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return
     if is_banned(update.effective_user.id):
         await update.message.reply_text("🚫 You are temporarily banned for 5 minutes due to flooding.")
         return
@@ -1252,6 +1340,8 @@ async def get_number_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Choose a service:", reply_markup=keyboard)
 
 async def get_main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return
     query = update.callback_query
     await query.answer()
     main_name = query.data.split(":",1)[1]
@@ -1288,6 +1378,8 @@ async def get_main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(f"Select a sub‑category for {main_name}:", reply_markup=keyboard)
 
 async def get_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -1299,6 +1391,8 @@ async def get_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await assign_number_and_display(query, main_name, sub_name, user_id, context)
 
 async def change_number_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -1375,9 +1469,11 @@ async def assign_number_and_display(query_or_update, main_name, sub_name, user_i
 FAKE_GENDER = 1
 
 async def fake_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return FAKE_GENDER
     if is_banned(update.effective_user.id):
         await update.message.reply_text("🚫 Banned.")
-        return
+        return ConversationHandler.END
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("👨 Male", callback_data="fake_male"),
          InlineKeyboardButton("👩 Female", callback_data="fake_female")]
@@ -1386,6 +1482,8 @@ async def fake_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return FAKE_GENDER
 
 async def fake_gender_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return FAKE_GENDER
     query = update.callback_query
     await query.answer()
     gender = query.data.split("_")[1]
@@ -1422,9 +1520,11 @@ async def fake_gender_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
 GET2FA_SECRET = 1
 
 async def get2fa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return ConversationHandler.END
     if is_banned(update.effective_user.id):
         await update.message.reply_text("🚫 Banned.")
-        return
+        return ConversationHandler.END
     await update.message.reply_text(
         "📲 <b>Paste your 2FA Secret Key</b>\n\n"
         "<i>Example: JBSWY3DPEHPK3PXP</i>",
@@ -1433,6 +1533,8 @@ async def get2fa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return GET2FA_SECRET
 
 async def get2fa_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return GET2FA_SECRET
     secret_raw = update.message.text.strip()
     secret_clean = re.sub(r'\s+', '', secret_raw).upper()
     if not re.fullmatch(r'[A-Z2-7]+', secret_clean):
@@ -1599,7 +1701,6 @@ async def upload_file_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
     sub_name = context.user_data.get("upload_sub")
     pool_key = f"{main_name}_{sub_name}" if sub_name else main_name
     pools = load_pools()
-    # REPLACE existing numbers instead of extending
     pools[pool_key] = numbers
     save_pools(pools)
     try:
@@ -1675,6 +1776,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 PROFILE_SELECT, SET_WALLET_METHOD, SET_WALLET_VALUE, WITHDRAW_METHOD, WITHDRAW_AMOUNT, EDIT_MENU, EDIT_PRICE, EDIT_RATE = range(8)
 
 async def profile_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return ConversationHandler.END
     user_id = update.effective_user.id
     if is_admin(user_id):
         await update.message.reply_text("👤 Profile Menu", reply_markup=ReplyKeyboardMarkup(admin_profile_kb(), resize_keyboard=True))
@@ -1684,6 +1787,8 @@ async def profile_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return PROFILE_SELECT
 
 async def profile_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return PROFILE_SELECT
     user_id = update.effective_user.id
     text = update.message.text
     if text == "⬅️ Back":
@@ -1787,6 +1892,8 @@ async def profile_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return PROFILE_SELECT
 
 async def profile_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return ConversationHandler.END
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -1809,6 +1916,8 @@ async def profile_callback_handler(update: Update, context: ContextTypes.DEFAULT
         return WITHDRAW_METHOD
 
 async def wallet_method_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return SET_WALLET_METHOD
     query = update.callback_query
     await query.answer()
     method = query.data.split("_")[1]
@@ -1818,6 +1927,8 @@ async def wallet_method_select(update: Update, context: ContextTypes.DEFAULT_TYP
     return SET_WALLET_VALUE
 
 async def wallet_value_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return SET_WALLET_VALUE
     user_id = update.effective_user.id
     value = update.message.text.strip()
     method = context.user_data["wallet_method"]
@@ -1832,6 +1943,8 @@ async def wallet_value_received(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 async def withdraw_method_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return WITHDRAW_METHOD
     query = update.callback_query
     await query.answer()
     method = query.data.replace("withdraw_method_", "")
@@ -1858,6 +1971,8 @@ async def withdraw_method_select(update: Update, context: ContextTypes.DEFAULT_T
     return WITHDRAW_AMOUNT
 
 async def withdraw_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return WITHDRAW_AMOUNT
     user_id = update.effective_user.id
     text = update.message.text.strip()
     try:
@@ -1941,6 +2056,9 @@ async def admin_complete_callback(update: Update, context: ContextTypes.DEFAULT_
 def main():
     application = Application.builder().token(TOKEN).build()
 
+    # Forced join callback
+    application.add_handler(CallbackQueryHandler(verify_join_callback, pattern="^verify_join$"))
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.Regex("^Get Number$"), get_number_start))
     application.add_handler(CallbackQueryHandler(get_main_callback, pattern="^get_main:"))
@@ -1948,9 +2066,15 @@ def main():
     application.add_handler(CallbackQueryHandler(change_number_callback, pattern="^change_number:"))
     application.add_handler(CallbackQueryHandler(admin_complete_callback, pattern="^admin_complete_"))
 
+    # Fake Name conversation
     fake_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Fake Name$"), fake_name_start)],
-        states={FAKE_GENDER: [CallbackQueryHandler(fake_gender_select, pattern="^fake_")]},
+        states={
+            FAKE_GENDER: [
+                CallbackQueryHandler(fake_gender_select, pattern="^fake_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, cancel)
+            ]
+        },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     application.add_handler(fake_conv)
@@ -2029,12 +2153,14 @@ def main():
     async def post_init(app: Application):
         asyncio.create_task(generic_monitor(app, session1, SITE1_BASE_URL, SITE1_USERNAME, SITE1_PASSWORD, "seen_pairs_site1.txt", "Site1", SITE1_CHECK_INTERVAL))
         asyncio.create_task(monitor_site2(app))
+        asyncio.create_task(monitor_site3(app))   # Now API based
         asyncio.create_task(monitor_site4(app))
-        asyncio.create_task(monitor_site5(app))
+        asyncio.create_task(generic_monitor(app, session6, SITE6_BASE_URL, SITE6_USERNAME, SITE6_PASSWORD, "seen_pairs_site6.txt", "Site6", SITE6_CHECK_INTERVAL))
+        asyncio.create_task(generic_monitor(app, session7, SITE7_BASE_URL, SITE7_USERNAME, SITE7_PASSWORD, "seen_pairs_site7.txt", "Site7 (Zento)", SITE7_CHECK_INTERVAL))
 
     application.post_init = post_init
 
-    logger.info("Bot started (Site1, Site2, Site4, Site5). Polling...")
+    logger.info("Bot started (Site1, Site2, Site3 (API), Site4, Site6, Site7). Site3 now uses API – no more 503 errors.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
